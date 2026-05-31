@@ -16,29 +16,52 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goarch: amd64
             wintun_arch: amd64
           - goarch: 386
             wintun_arch: x86
-          - goarch: arm64
-            wintun_arch: arm64
-          - goarch: arm
-            wintun_arch: arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Install goversioninfo
         run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
 
+      - name: Derive version from tag
+        id: ver
+        run: |
+          REF="${{ github.ref_name }}"
+          VERSION="${REF#v}"
+          # Fallback for workflow_dispatch / non-version refs.
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+(\.[0-9]+){0,2}'; then
+            VERSION="0.0.0-${GITHUB_SHA::7}"
+          fi
+          CORE="${VERSION%%-*}"
+          MAJOR="$(printf '%s' "$CORE" | cut -d. -f1)"
+          MINOR="$(printf '%s' "$CORE" | cut -d. -f2)"
+          PATCH="$(printf '%s' "$CORE" | cut -d. -f3)"
+          echo "version=$VERSION"  >> "$GITHUB_OUTPUT"
+          echo "major=${MAJOR:-0}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR:-0}" >> "$GITHUB_OUTPUT"
+          echo "patch=${PATCH:-0}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (${MAJOR:-0}.${MINOR:-0}.${PATCH:-0})"
+
       - name: Regenerate .syso for target arch
-        run: GOARCH=${{ matrix.goarch }} "$(go env GOPATH)/bin/goversioninfo" -o rsrc_windows.syso versioninfo.json
+        run: >
+          GOARCH=${{ matrix.goarch }} "$(go env GOPATH)/bin/goversioninfo"
+          -ver-major=${{ steps.ver.outputs.major }}
+          -ver-minor=${{ steps.ver.outputs.minor }}
+          -ver-patch=${{ steps.ver.outputs.patch }}
+          -product-version="${{ steps.ver.outputs.version }}"
+          -file-version="${{ steps.ver.outputs.version }}"
+          -o rsrc_windows.syso versioninfo.json
 
       - name: Download wintun
         run: |
@@ -50,7 +73,10 @@ jobs:
           GOOS: windows
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: go build -trimpath -ldflags="-s -w -H windowsgui" -o wgkeybot.exe .
+        run: >
+          go build -trimpath
+          -ldflags="-s -w -H windowsgui -X github.com/wgkeybot/windows/tray.Version=${{ steps.ver.outputs.version }}"
+          -o wgkeybot.exe .
 
       - name: Sign binary (self-signed cert)
         run: |

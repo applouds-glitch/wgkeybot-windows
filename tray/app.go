@@ -18,7 +18,8 @@ import (
 )
 
 // Version отображается в пункте «О программе».
-const Version = "1.1.0"
+// Значение подставляется при сборке через -ldflags "-X .../tray.Version=...".
+var Version = "dev"
 
 // App manages the system tray icon and tunnel lifecycle.
 type App struct {
@@ -64,7 +65,7 @@ func (a *App) OnReady() {
 	}
 
 	systray.SetIcon(assets.IconDisconnected())
-	systray.SetTooltip("WgKeyBot – отключено")
+	systray.SetTooltip("Отключено")
 
 	a.mConnect = systray.AddMenuItem("Подключить...", "Выбрать .conf и подключиться")
 	a.mDisconnect = systray.AddMenuItem("Отключить", "Остановить VPN туннель")
@@ -241,6 +242,7 @@ func (a *App) doAutoConnect() {
 
 	a.setConnected()
 	go a.watchStatus(ctx)
+	mgr.StartWatchdog(ctx, func() { go a.doWatchdogReconnect() })
 }
 
 func (a *App) doConnect() {
@@ -301,6 +303,81 @@ func (a *App) doConnect() {
 
 	a.setConnected()
 	go a.watchStatus(ctx)
+	mgr.StartWatchdog(ctx, func() { go a.doWatchdogReconnect() })
+}
+
+// doWatchdogReconnect вызывается watchdog'ом когда WG handshake умер.
+// Отключает текущий туннель и переподключается с тем же конфигом.
+func (a *App) doWatchdogReconnect() {
+	a.mu.Lock()
+	cfg := a.cfg
+	mode := a.settings.Mode
+	socksPort := a.settings.SocksPort
+	if a.connecting || cfg == nil {
+		a.mu.Unlock()
+		return
+	}
+	a.connecting = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.connecting = false
+		a.mu.Unlock()
+	}()
+
+	log.Printf("[Tray] Watchdog triggered reconnect")
+	a.teardown()
+
+	// Остаёмся в "connecting" состоянии — кнопка "Отключить" остаётся активной.
+	a.setConnecting()
+	go Notify("WgKeyBot", "Соединение потеряно — переподключение...", niifWarning)
+
+	// Прерываемая 3-секундная пауза: храним cancel в a.cancel, чтобы
+	// doDisconnect мог прервать ожидание через teardown().
+	delayCtx, delayCancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.cancel = delayCancel
+	a.mu.Unlock()
+
+	select {
+	case <-delayCtx.Done():
+		// Пользователь нажал "Отключить" — teardown уже почистил a.cancel.
+		a.setDisconnected()
+		return
+	case <-time.After(3 * time.Second):
+	}
+
+	// Снимаем cancel паузы и переходим к реальному подключению.
+	// (Если сюда дошли, значит time.After сработал раньше teardown — пауза прошла.)
+	a.mu.Lock()
+	a.cancel = nil
+	a.mu.Unlock()
+	delayCancel()
+
+	mgr := winbridge.NewManager(cfg)
+	mgr.SetMode(mode, socksPort)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a.mu.Lock()
+	a.manager = mgr
+	a.cfg = cfg
+	a.cancel = cancel
+	a.mu.Unlock()
+
+	if err := mgr.Connect(ctx); err != nil {
+		log.Printf("[Tray] watchdog reconnect error: %v", err)
+		a.mu.Lock()
+		a.manager = nil
+		a.cancel = nil
+		a.mu.Unlock()
+		cancel()
+		a.setDisconnected()
+		return
+	}
+
+	a.setConnected()
+	go a.watchStatus(ctx)
+	mgr.StartWatchdog(ctx, func() { go a.doWatchdogReconnect() })
 }
 
 func (a *App) doDisconnect() {
@@ -310,7 +387,8 @@ func (a *App) doDisconnect() {
 }
 
 // teardown синхронно останавливает активный туннель, если он есть.
-// Возвращает true, если туннель был запущен.
+// Возвращает true, если была отменена любая активность (туннель или ожидающий
+// reconnect), чтобы doDisconnect мог перейти в disconnected-состояние.
 func (a *App) teardown() bool {
 	a.mu.Lock()
 	mgr := a.manager
@@ -319,14 +397,15 @@ func (a *App) teardown() bool {
 	a.cancel = nil
 	a.mu.Unlock()
 
+	hadActivity := cancel != nil
 	if cancel != nil {
 		cancel()
 	}
 	if mgr != nil {
 		mgr.Disconnect()
-		return true
+		hadActivity = true
 	}
-	return false
+	return hadActivity
 }
 
 func (a *App) doImport() {
@@ -425,16 +504,16 @@ func (a *App) watchStatus(ctx context.Context) {
 // buildTooltip формирует понятную обычному пользователю подсказку для иконки.
 func buildTooltip(uptime time.Duration, st winbridge.TunnelStats, settings winbridge.AppSettings) string {
 	if !st.Connected {
-		return "WgKeyBot – отключено"
+		return "Отключено"
 	}
 
-	header := "WgKeyBot – защита включена"
+	header := "Защита включена"
 	if settings.Mode == winbridge.ModeSOCKS {
-		header = fmt.Sprintf("WgKeyBot – SOCKS прокси 127.0.0.1:%d", settings.SocksPort)
+		header = fmt.Sprintf("SOCKS прокси 127.0.0.1:%d", settings.SocksPort)
 	}
 	// Если рукопожатия не было дольше 3 минут — связь с сервером потеряна.
 	if st.LastHandshake.IsZero() || time.Since(st.LastHandshake) > 3*time.Minute {
-		header = "WgKeyBot – восстановление связи…"
+		header = "Восстановление связи…"
 	}
 
 	line2 := "В сети: " + formatDuration(uptime)
@@ -473,7 +552,7 @@ func (a *App) handleCaptcha(ctx context.Context, mgr *winbridge.Manager, url str
 func (a *App) setConnecting() {
 	a.cancelBlink()
 	systray.SetIcon(assets.IconConnecting())
-	systray.SetTooltip("WgKeyBot – подключение…")
+	systray.SetTooltip("Подключение…")
 	a.mConnect.Disable()
 	a.mDisconnect.Enable()
 
@@ -507,10 +586,10 @@ func (a *App) setConnected() {
 	systray.SetIcon(assets.IconConnected())
 	if a.settings.Mode == winbridge.ModeSOCKS {
 		addr := fmt.Sprintf("127.0.0.1:%d", a.settings.SocksPort)
-		systray.SetTooltip("WgKeyBot – SOCKS прокси " + addr)
+		systray.SetTooltip("SOCKS прокси " + addr)
 		go Notify("SOCKS прокси", "Запущен на "+addr, niifInfo)
 	} else {
-		systray.SetTooltip("WgKeyBot – защита включена")
+		systray.SetTooltip("Защита включена")
 		go Notify("VPN", "Подключено", niifInfo)
 	}
 	a.mConnect.Disable()
@@ -520,7 +599,7 @@ func (a *App) setConnected() {
 func (a *App) setDisconnected() {
 	a.cancelBlink()
 	systray.SetIcon(assets.IconDisconnected())
-	systray.SetTooltip("WgKeyBot – отключено")
+	systray.SetTooltip("Отключено")
 	a.mConnect.Enable()
 	a.mDisconnect.Disable()
 	go Notify("VPN", "Отключено", niifInfo)

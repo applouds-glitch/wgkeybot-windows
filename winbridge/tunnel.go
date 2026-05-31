@@ -398,6 +398,57 @@ func sanitizeIfaceName(name string) string {
 	return name
 }
 
+// StartWatchdog запускает фоновую горутину, которая следит за состоянием WG
+// handshake. Если handshake устарел (>3 мин) при растущем TX — соединение
+// считается мёртвым, и вызывается onDead. Горутина завершается при отмене ctx
+// или если туннель уже отключён.
+func (m *Manager) StartWatchdog(ctx context.Context, onDead func()) {
+	const (
+		pollInterval = 30 * time.Second
+		staleAfter   = 3 * time.Minute
+		neverAfter   = 150 * time.Second
+		deadChecksMax = 2
+	)
+	go func() {
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		upSince := time.Now()
+		var prevTx uint64
+		prevTxSet := false
+		deadChecks := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			stats := m.Stats()
+			if !stats.Connected {
+				return
+			}
+			now := time.Now()
+			isDead := false
+			if stats.LastHandshake.IsZero() {
+				isDead = now.Sub(upSince) > neverAfter
+			} else if now.Sub(stats.LastHandshake) > staleAfter {
+				isDead = prevTxSet && stats.TxBytes > prevTx
+			}
+			prevTx = stats.TxBytes
+			prevTxSet = true
+			if !isDead {
+				deadChecks = 0
+				continue
+			}
+			deadChecks++
+			if deadChecks >= deadChecksMax {
+				log.Printf("[Manager] Watchdog: WG handshake stale — triggering reconnect")
+				onDead()
+				return
+			}
+		}
+	}()
+}
+
 // parseWGStats извлекает счётчики трафика и время рукопожатия из UAPI-ответа.
 func parseWGStats(uapi string) TunnelStats {
 	st := TunnelStats{Connected: true}
