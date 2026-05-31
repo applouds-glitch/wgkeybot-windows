@@ -1,0 +1,107 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WINTUN_VERSION: "0.14.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            wintun_arch: amd64
+          - goarch: 386
+            wintun_arch: x86
+          - goarch: arm64
+            wintun_arch: arm64
+          - goarch: arm
+            wintun_arch: arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install goversioninfo
+        run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+
+      - name: Regenerate .syso for target arch
+        run: GOARCH=${{ matrix.goarch }} "$(go env GOPATH)/bin/goversioninfo" -o rsrc_windows.syso versioninfo.json
+
+      - name: Download wintun
+        run: |
+          curl -sSL "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip" -o wintun.zip
+          unzip -j wintun.zip "wintun/bin/${{ matrix.wintun_arch }}/wintun.dll"
+
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w -H windowsgui" -o wgkeybot.exe .
+
+      - name: Sign binary (self-signed cert)
+        run: |
+          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+            -days 3650 -nodes -subj "/CN=WgKeyBot/O=WgKeyBot/OU=Development"
+          openssl pkcs12 -export -out cert.pfx -inkey key.pem -in cert.pem -passout pass:temp
+          sudo apt-get install -y osslsigncode >/dev/null 2>&1
+          osslsigncode sign -pkcs12 cert.pfx -pass temp \
+            -n "WgKeyBot" -i "https://github.com/wgkeybot/windows" \
+            -t "http://timestamp.digicert.com" \
+            -in wgkeybot.exe -out wgkeybot-signed.exe
+          mv wgkeybot-signed.exe wgkeybot.exe
+          rm -f key.pem cert.pem cert.pfx
+
+      - name: Package
+        run: zip "wgkeybot-${{ github.ref_name }}-windows-${{ matrix.goarch }}.zip" wgkeybot.exe wintun.dll
+
+      - name: Generate release notes
+        if: matrix.goarch == 'amd64'
+        id: release_notes
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^${{ github.ref_name }}$" | head -n 1)
+          if [ -n "$PREVIOUS_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" "$PREVIOUS_TAG..HEAD")
+            CHANGELOG_LINK="https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${{ github.ref_name }}"
+          else
+            COMMITS=$(git log --pretty=format:"- %s (%h)")
+            CHANGELOG_LINK=""
+          fi
+          cat > RELEASE_NOTES.md << EOF
+          ## What's Changed
+
+          $COMMITS
+
+          $CHANGELOG_LINK
+          EOF
+          echo "file=RELEASE_NOTES.md" >> $GITHUB_OUTPUT
+
+      - name: Release (amd64, with notes)
+        if: matrix.goarch == 'amd64'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wgkeybot-${{ github.ref_name }}-windows-${{ matrix.goarch }}.zip
+          body_path: RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release (attach only)
+        if: matrix.goarch != 'amd64'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wgkeybot-${{ github.ref_name }}-windows-${{ matrix.goarch }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

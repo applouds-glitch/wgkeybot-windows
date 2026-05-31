@@ -1,0 +1,25 @@
+# Build output
+*.exe
+*.dll
+*.syso.bak
+
+# Go
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+wgkeybot.log
+*.conf
