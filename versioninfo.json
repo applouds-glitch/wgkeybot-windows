@@ -10,12 +10,15 @@
   },
   "StringFileInfo": {
     "CompanyName":      "WgKeyBot",
-    "FileDescription":  "WgKeyBot",
+    "FileDescription":  "WgKeyBot — WireGuard VPN client",
     "FileVersion":      "1.1.0",
-    "InternalName":     "WgKeyBot",
+    "InternalName":     "wgkeybot",
+    "LegalCopyright":   "Copyright (C) 2026 WgKeyBot. All rights reserved.",
+    "LegalTrademarks":  "",
     "OriginalFilename": "wgkeybot.exe",
     "ProductName":      "WgKeyBot",
-    "ProductVersion":   "1.1.0"
+    "ProductVersion":   "1.1.0",
+    "Comments":         "https://github.com/wgkeybot/windows"
   },
   "VarFileInfo": {
     "Translation": {

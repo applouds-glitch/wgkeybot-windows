@@ -52,6 +52,7 @@ type App struct {
 
 // New creates the tray App. Pass debug=true to enable log file and log menu item.
 func New(debug bool) *App {
+	winbridge.AppVersion = Version
 	return &App{
 		debug:    debug,
 		settings: winbridge.LoadSettings(),
@@ -418,9 +419,14 @@ func (a *App) doImport() {
 		return
 	}
 
-	data, err := winbridge.FetchConfigFromToken(token)
+	data, accessToken, err := winbridge.InitFromToken(token)
 	if err != nil {
-		go ShowError("Ошибка импорта", err.Error())
+		var upg *winbridge.UpgradeRequiredError
+		if errors.As(err, &upg) {
+			go ShowError("Требуется обновление", upg.Error())
+		} else {
+			go ShowError("Ошибка импорта", err.Error())
+		}
 		return
 	}
 
@@ -429,24 +435,32 @@ func (a *App) doImport() {
 		return
 	}
 
-	// Сохраняем токен, чтобы потом можно было обновить конфиг без повторного ввода.
-	a.settings.Token = token
+	a.settings.AccessToken = accessToken
 	winbridge.SaveSettings(a.settings)
 
 	go Notify("Импорт", "Настройки подключения получены", niifInfo)
 }
 
-// doUpdate перезагружает конфиг по сохранённому токену.
+// doUpdate перезагружает конфиг по сохранённому access_token.
 func (a *App) doUpdate() {
-	if a.settings.Token == "" {
+	if a.settings.AccessToken == "" {
 		go ShowError("Обновление конфига",
-			"Токен не сохранён.\nСначала выполните «Импорт токена...».")
+			"Сессия не найдена.\nСначала выполните «Импорт токена...».")
 		return
 	}
 
-	data, err := winbridge.FetchConfigFromToken(a.settings.Token)
+	data, err := winbridge.FetchConfig(a.settings.AccessToken)
 	if err != nil {
-		go ShowError("Ошибка обновления", err.Error())
+		if errors.Is(err, winbridge.ErrUnauthorized) {
+			go ShowError("Обновление конфига", winbridge.ErrUnauthorized.Error())
+		} else {
+			var upg *winbridge.UpgradeRequiredError
+			if errors.As(err, &upg) {
+				go ShowError("Требуется обновление", upg.Error())
+			} else {
+				go ShowError("Ошибка обновления", err.Error())
+			}
+		}
 		return
 	}
 

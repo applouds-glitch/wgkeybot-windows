@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -210,38 +212,100 @@ func (c *TunnelConfig) BuildWGUAPIConfig(listenAddr string) string {
 	return sb.String()
 }
 
-// FetchConfigFromToken загружает конфиг с key.shadowgate.online по токену.
-// API возвращает JSON: {"ok": true, "config": "[Interface]\n..."}.
-func FetchConfigFromToken(token string) ([]byte, error) {
-	apiURL := "https://key.shadowgate.online/api/config/" + strings.TrimSpace(token)
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(apiURL)
+const apiBaseURL = "https://key.shadowgate.online"
+
+// AppVersion отправляется в заголовке X-App-Version каждого запроса к API.
+// Устанавливается пакетом tray при старте.
+var AppVersion = "dev"
+
+// ErrUnauthorized возвращается когда сервер отвечает 401.
+// Пользователю нужно заново выполнить импорт токена.
+var ErrUnauthorized = errors.New("сессия устарела, выполните «Импорт токена...» заново")
+
+// UpgradeRequiredError возвращается когда сервер отвечает 426.
+type UpgradeRequiredError struct {
+	DownloadURL string
+}
+
+func (e *UpgradeRequiredError) Error() string {
+	return "требуется обновление приложения"
+}
+
+// apiGet выполняет GET-запрос к API с заголовками X-App-Version и Authorization.
+func apiGet(urlStr, accessToken string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-App-Version", strings.SplitN(AppVersion, "-", 2)[0])
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
-	}
 
-	var result struct {
-		OK     bool   `json:"ok"`
-		Config string `json:"config"`
-		Error  string `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
-	}
-	if !result.OK {
-		if result.Error != "" {
-			return nil, fmt.Errorf("server error: %s", result.Error)
+	body, _ := io.ReadAll(resp.Body)
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		return nil, ErrUnauthorized
+	case http.StatusUpgradeRequired:
+		var j struct {
+			DownloadURL string `json:"download_url"`
 		}
-		return nil, fmt.Errorf("server returned ok=false")
+		json.Unmarshal(body, &j)
+		return nil, &UpgradeRequiredError{DownloadURL: j.DownloadURL}
+	default:
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("сервер вернул %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		return body, nil
+	}
+}
+
+// InitFromToken выполняет первичный импорт по одноразовому токену.
+// Возвращает конфиг и access_token для последующих вызовов FetchConfig.
+func InitFromToken(token string) (config []byte, accessToken string, err error) {
+	body, err := apiGet(apiBaseURL+"/api/v1/init/"+strings.TrimSpace(token), "")
+	if err != nil {
+		return nil, "", err
+	}
+	var result struct {
+		AccessToken string `json:"access_token"`
+		Config      string `json:"config"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, "", fmt.Errorf("parse response: %w", err)
+	}
+	if result.AccessToken == "" {
+		return nil, "", fmt.Errorf("сервер вернул пустой access_token")
 	}
 	if result.Config == "" {
-		return nil, fmt.Errorf("empty config in response")
+		return nil, "", fmt.Errorf("сервер вернул пустой config")
 	}
-	return []byte(result.Config), nil
+	return []byte(strings.TrimSpace(result.Config)), result.AccessToken, nil
+}
+
+// FetchConfig обновляет конфиг по сохранённому access_token.
+func FetchConfig(accessToken string) ([]byte, error) {
+	body, err := apiGet(apiBaseURL+"/api/v1/config", accessToken)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Config string `json:"config"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	if result.Config == "" {
+		return nil, fmt.Errorf("сервер вернул пустой config")
+	}
+	return []byte(strings.TrimSpace(result.Config)), nil
 }
 
 // DefaultConfigDir возвращает директорию хранения конфигов.

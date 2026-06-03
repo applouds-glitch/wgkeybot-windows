@@ -379,8 +379,8 @@ func generateHumanCursor() string {
 			startX -= rand.Intn(8) + 2
 			startY -= rand.Intn(5) + 1
 		} else {
-			startX += rand.Intn(20) - 5  // -5..+14
-			startY += rand.Intn(18) - 3  // -3..+14 — not always downward
+			startX += rand.Intn(20) - 5 // -5..+14
+			startY += rand.Intn(18) - 3 // -3..+14 — not always downward
 		}
 		startTime += int64(rand.Intn(50) + 15) // 15-65ms between points
 		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, startX, startY, startTime))
@@ -394,7 +394,7 @@ func generateSensorNoise() string {
 	accelPoints := make([]string, 8+rand.Intn(6))
 	for i := range accelPoints {
 		accelPoints[i] = fmt.Sprintf(`{"x":%.4f,"y":%.4f,"z":%.4f}`,
-			(rand.Float64()-0.5)*0.04,   // ±0.02g
+			(rand.Float64()-0.5)*0.04, // ±0.02g
 			(rand.Float64()-0.5)*0.04,
 			1.0+(rand.Float64()-0.5)*0.03) // ~1g gravity ± noise
 	}
@@ -470,7 +470,7 @@ func fetchCaptchaBootstrap(ctx context.Context, redirectURI string, client tlscl
 }
 
 func buildCaptchaDeviceJSON(profile Profile, vp captchaViewport) string {
-	availHeight := vp.Height - 40 - rand.Intn(21) // taskbar: 40-60px
+	availHeight := vp.Height - 40 - rand.Intn(21)  // taskbar: 40-60px
 	innerHeight := vp.Height - 111 - rand.Intn(31) // browser chrome: 111-141px
 	devicePixelRatio := 1
 	if vp.Width >= 2560 {
@@ -482,7 +482,7 @@ func buildCaptchaDeviceJSON(profile Profile, vp captchaViewport) string {
 		vp.Width, vp.Height, vp.Width, availHeight, vp.Width, innerHeight,
 		devicePixelRatio,
 		8+rand.Intn(9),  // 8-16 cores
-		8+rand.Intn(25),  // 8-32 GB
+		8+rand.Intn(25), // 8-32 GB
 		profile.UserAgent,
 	)
 }

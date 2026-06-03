@@ -5,7 +5,6 @@
 
 package proxy
 
-
 import (
 	"bytes"
 	"context"
@@ -22,18 +21,18 @@ import (
 
 // DnsCache stores cached IP addresses
 type DnsCache struct {
-	mu   sync.RWMutex
-	ips  map[string]string
+	mu  sync.RWMutex
+	ips map[string]string
 }
 
 const (
-	dnsTimeout     = 2 * time.Second
-	dohTimeout     = 2 * time.Second
-	dotTimeout     = 2 * time.Second
-	yandexIP       = "77.88.8.8"
-	yandexDomain   = "common.dot.dns.yandex.net"
-	googleIP       = "8.8.8.8"
-	googleDomain   = "dns.google"
+	dnsTimeout   = 2 * time.Second
+	dohTimeout   = 2 * time.Second
+	dotTimeout   = 2 * time.Second
+	yandexIP     = "77.88.8.8"
+	yandexDomain = "common.dot.dns.yandex.net"
+	googleIP     = "8.8.8.8"
+	googleDomain = "dns.google"
 )
 
 // DNSServerType represents the type of DNS server
@@ -78,6 +77,28 @@ var (
 		ips: make(map[string]string),
 	}
 )
+
+// ResolvedHostIPs returns every unique IP currently in the DNS cache — i.e. the
+// control-plane hosts pkg/proxy resolved during bootstrap (VK/OK auth servers
+// like login/api/id/static.vk.ru and calls.okcdn.ru). winbridge installs
+// physical-gateway bypass routes for these so a credential re-fetch after the
+// VPN is up does not route VK traffic into the tunnel — which would deadlock
+// (the tunnel needs creds, and getting creds would need the tunnel). The cache
+// has no TTL, so these IPs stay stable for the session and the routes keep
+// covering every re-fetch.
+func ResolvedHostIPs() []string {
+	hostCache.mu.RLock()
+	defer hostCache.mu.RUnlock()
+	seen := make(map[string]bool)
+	var ips []string
+	for _, ip := range hostCache.ips {
+		if ip != "" && !seen[ip] {
+			seen[ip] = true
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
 
 // Resolve resolves DNS name using cache and ordered server list
 func (c *DnsCache) Resolve(ctx context.Context, domain string) (string, error) {
@@ -403,9 +424,9 @@ func parseDNSResponse(response []byte, domain string) (string, error) {
 		}
 
 		qtype := binary.BigEndian.Uint16(response[offset : offset+2])
-		offset += 2      // TYPE
-		offset += 2      // CLASS
-		offset += 4      // TTL
+		offset += 2 // TYPE
+		offset += 2 // CLASS
+		offset += 4 // TTL
 		rdLength := binary.BigEndian.Uint16(response[offset : offset+2])
 		offset += 2
 

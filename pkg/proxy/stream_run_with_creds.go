@@ -23,6 +23,7 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass, addr string, cfg 
 
 	dialer := &net.Dialer{
 		Timeout: 30 * time.Second,
+		Control: protectControl,
 	}
 
 	var turnConn net.PacketConn
@@ -59,7 +60,13 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass, addr string, cfg 
 		return fmt.Errorf("TURN listen: %w", err)
 	}
 
+	select {
+	case allocSemaphore <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	relayConn, err := client.Allocate()
+	<-allocSemaphore
 	if err != nil {
 		return fmt.Errorf("TURN allocate: %w", err)
 	}

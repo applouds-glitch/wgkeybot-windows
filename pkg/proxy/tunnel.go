@@ -92,8 +92,8 @@ type Tunnel struct {
 	bootCancel context.CancelFunc
 	bootResult int32
 
-	device  *device.Device
-	tunDev  tun.Device
+	device   *device.Device
+	tunDev   tun.Device
 	stopOnce sync.Once
 }
 
@@ -344,6 +344,11 @@ func (t *Tunnel) IpcGet() (string, error) {
 // Вызывается после WaitReady для получения динамически резолвленных IP-адресов,
 // которым нужны bypass-маршруты до установки VPN-маршрутов.
 func (t *Tunnel) ActiveTURNAddrs() []string { return ActiveTURNAddrs() }
+
+// AuthBypassIPs возвращает IP control-plane хостов (VK/OK auth), зарезолвленных
+// при bootstrap. winbridge ставит для них bypass-маршруты мимо VPN — иначе
+// ре-фетч credentials после поднятия туннеля уходит в сам туннель и виснет.
+func (t *Tunnel) AuthBypassIPs() []string { return ResolvedHostIPs() }
 
 // ActiveTURNServer возвращает настроенный IP TURN-сервера (если задан явно).
 func (t *Tunnel) ActiveTURNServer() string {

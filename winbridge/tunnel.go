@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wgkeybot/windows/pkg/proxy"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 // LogPath — путь к файлу логов (устанавливается через InitLogging).
@@ -41,7 +42,8 @@ type Manager struct {
 	socks     *SocksServer
 	mode      Mode
 	socksPort int
-	physGW    string // physical gateway at connect time, for detecting network changes
+	physGW    string        // physical gateway at connect time, for detecting network changes
+	wgLUID    winipcfg.LUID // wintun adapter LUID (VPN mode), for route cleanup on disconnect
 	connected bool
 }
 
@@ -220,8 +222,13 @@ func (m *Manager) Connect(ctx context.Context) error {
 			return fmt.Errorf("attach WireGuard: %w", err)
 		}
 
-		// 10. Назначаем IP и DNS через netsh.
-		if err := SetupInterface(wgCfg.InterfaceName, cfg.Address, cfg.DNS); err != nil {
+		// 10. Назначаем IP и DNS через IP Helper API (по LUID адаптера).
+		luid := winipcfg.LUID(t.InterfaceLUID())
+		if luid == 0 {
+			return fmt.Errorf("setup interface: wintun adapter LUID unavailable")
+		}
+		m.wgLUID = luid
+		if err := SetupInterface(luid, cfg.Address, cfg.DNS); err != nil {
 			return fmt.Errorf("setup interface: %w", err)
 		}
 
@@ -242,8 +249,18 @@ func (m *Manager) Connect(ctx context.Context) error {
 			}
 		}
 
+		// 11b. Bypass-маршруты для VK/OK auth-хостов (login/api/id/static.vk.ru,
+		//      calls.okcdn.ru) по их зарезолвленным при bootstrap IP. Без этого
+		//      ре-фетч credentials после поднятия VPN уходит в туннель и виснет
+		//      (туннелю нужны creds, а creds нужен туннель). Используем тот же
+		//      механизм /32-через-physGW, маршруты снимаются на Disconnect.
+		if authIPs := m.tunnel.AuthBypassIPs(); len(authIPs) > 0 {
+			log.Printf("[Manager] Adding auth bypass routes for: %v", authIPs)
+			routeMgr.AddTURNRoutes(authIPs)
+		}
+
 		// 12. Добавляем VPN маршруты (AllowedIPs).
-		if err := AddVPNRoutes(wgCfg.InterfaceName, cfg.AllowedIPs); err != nil {
+		if err := AddVPNRoutes(luid, cfg.AllowedIPs); err != nil {
 			log.Printf("[Manager] Warning: add VPN routes: %v", err)
 		}
 	}
@@ -272,8 +289,9 @@ func (m *Manager) Disconnect() {
 	}
 
 	// Удаляем VPN маршруты (только в VPN-режиме они добавлялись).
-	if m.mode == ModeVPN && cfg != nil {
-		RemoveVPNRoutes(sanitizeIfaceName(cfg.Name), cfg.AllowedIPs)
+	if m.mode == ModeVPN && cfg != nil && m.wgLUID != 0 {
+		RemoveVPNRoutes(m.wgLUID, cfg.AllowedIPs)
+		m.wgLUID = 0
 	}
 
 	// Останавливаем тоннель (TURN + WireGuard)
@@ -404,9 +422,9 @@ func sanitizeIfaceName(name string) string {
 // или если туннель уже отключён.
 func (m *Manager) StartWatchdog(ctx context.Context, onDead func()) {
 	const (
-		pollInterval = 30 * time.Second
-		staleAfter   = 3 * time.Minute
-		neverAfter   = 150 * time.Second
+		pollInterval  = 30 * time.Second
+		staleAfter    = 3 * time.Minute
+		neverAfter    = 150 * time.Second
 		deadChecksMax = 2
 	)
 	go func() {
@@ -425,6 +443,17 @@ func (m *Manager) StartWatchdog(ctx context.Context, onDead func()) {
 			stats := m.Stats()
 			if !stats.Connected {
 				return
+			}
+			// Пока висит капча, TURN-прокси заблокирован в ожидании ответа
+			// пользователя, поэтому WG handshake закономерно устаревает. Это НЕ
+			// мёртвый туннель: reconnect здесь отменил бы ctx и снёс окно капчи
+			// прямо во время решения, зациклив процесс. Сбрасываем счётчики, чтобы
+			// после решения капчи туннель получил свежий grace-период.
+			if m.PendingCaptchaURL() != "" {
+				upSince = time.Now()
+				prevTxSet = false
+				deadChecks = 0
+				continue
 			}
 			now := time.Now()
 			isDead := false

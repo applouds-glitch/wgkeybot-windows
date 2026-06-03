@@ -21,9 +21,8 @@ const DefaultSocksPort = 1080
 // AppSettings хранит пользовательские настройки приложения.
 type AppSettings struct {
 	AutoConnect bool `json:"auto_connect"`
-	// Token — последний импортированный токен WgKeyBot.
-	// Сохраняется, чтобы можно было обновить конфиг без повторного ввода.
-	Token string `json:"token"`
+	// AccessToken — Bearer-токен для /api/v1/config, полученный при init.
+	AccessToken string `json:"access_token,omitempty"`
 	// Mode — режим работы туннеля (vpn / socks). По умолчанию vpn.
 	Mode Mode `json:"mode"`
 	// SocksPort — порт локального SOCKS5-сервера в режиме socks.

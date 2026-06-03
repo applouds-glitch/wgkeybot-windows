@@ -14,6 +14,7 @@ require (
 	github.com/pion/turn/v5 v5.0.2
 	golang.org/x/sys v0.39.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
+	golang.zx2c4.com/wireguard/windows v0.5.3
 )
 
 require (

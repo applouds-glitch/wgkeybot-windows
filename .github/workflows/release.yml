@@ -78,18 +78,11 @@ jobs:
           -ldflags="-s -w -H windowsgui -X github.com/wgkeybot/windows/tray.Version=${{ steps.ver.outputs.version }}"
           -o wgkeybot.exe .
 
-      - name: Sign binary (self-signed cert)
-        run: |
-          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
-            -days 3650 -nodes -subj "/CN=WgKeyBot/O=WgKeyBot/OU=Development"
-          openssl pkcs12 -export -out cert.pfx -inkey key.pem -in cert.pem -passout pass:temp
-          sudo apt-get install -y osslsigncode >/dev/null 2>&1
-          osslsigncode sign -pkcs12 cert.pfx -pass temp \
-            -n "WgKeyBot" -i "https://github.com/wgkeybot/windows" \
-            -t "http://timestamp.digicert.com" \
-            -in wgkeybot.exe -out wgkeybot-signed.exe
-          mv wgkeybot-signed.exe wgkeybot.exe
-          rm -f key.pem cert.pem cert.pfx
+      # NOTE: builds ship UNSIGNED on purpose. A self-signed Authenticode
+      # signature does not chain to a trusted root and makes Defender/SmartScreen
+      # MORE suspicious, not less. When a real OV/EV code-signing cert is
+      # available, add a signing step here (osslsigncode with the .pfx from
+      # repo secrets) — never re-introduce self-signed signing.
 
       - name: Package
         run: zip "wgkeybot-${{ github.ref_name }}-windows-${{ matrix.goarch }}.zip" wgkeybot.exe wintun.dll

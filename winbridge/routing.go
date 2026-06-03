@@ -3,199 +3,197 @@ package winbridge
 import (
 	"fmt"
 	"log"
-	"net"
-	"os/exec"
-	"strings"
-	"syscall"
+	"net/netip"
+	"strconv"
+
+	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 // RouteManager управляет маршрутами Windows на время жизни тоннеля.
 // Принцип: перед поднятием WireGuard-интерфейса запоминаем физический
 // шлюз по умолчанию и добавляем явные host-маршруты для TURN-серверов
 // через этот шлюз. После остановки тоннеля — удаляем их.
+//
+// Вся работа идёт через IP Helper API (winipcfg), без запуска netsh/route —
+// спавн внешних процессов из админ-процесса повышает heuristic-score антивируса.
 type RouteManager struct {
-	physicalGW string // IP шлюза физической сети
-	turnRoutes []string
+	physLUID   winipcfg.LUID // LUID физического интерфейса с дефолтным маршрутом
+	physGW     netip.Addr    // IP шлюза физической сети
+	turnRoutes []netip.Addr  // добавленные TURN host-маршруты (для отката)
 }
 
 // NewRouteManager создаёт RouteManager, определяя текущий дефолтный шлюз.
 func NewRouteManager() (*RouteManager, error) {
-	gw, iface, err := DefaultGateway()
+	gw, luid, ifIndex, err := defaultRoute()
 	if err != nil {
 		return nil, fmt.Errorf("cannot find default gateway: %w", err)
 	}
-	log.Printf("[ROUTE] Physical gateway: %s via %s", gw, iface)
-	return &RouteManager{physicalGW: gw}, nil
+	log.Printf("[ROUTE] Physical gateway: %s via ifindex %d", gw, ifIndex)
+	return &RouteManager{physLUID: luid, physGW: gw}, nil
 }
 
 // AddTURNRoutes добавляет явные host-маршруты для TURN-серверов через
 // физический шлюз. Вызывается ПЕРЕД поднятием WireGuard-интерфейса.
 func (r *RouteManager) AddTURNRoutes(turnServerIPs []string) {
-	for _, ip := range turnServerIPs {
-		if net.ParseIP(ip) == nil {
-			log.Printf("[ROUTE] Skipping non-IP: %s", ip)
+	for _, ipStr := range turnServerIPs {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			log.Printf("[ROUTE] Skipping non-IP: %s", ipStr)
 			continue
 		}
-		if err := r.addRoute(ip+"/32", r.physicalGW); err != nil {
+		if ip.Is4() != r.physGW.Is4() {
+			log.Printf("[ROUTE] Skipping %s: address family differs from gateway %s", ip, r.physGW)
+			continue
+		}
+		dst := netip.PrefixFrom(ip, ip.BitLen()) // /32 или /128
+		if err := r.physLUID.AddRoute(dst, r.physGW, 0); err != nil {
 			log.Printf("[ROUTE] Warning: cannot add route for %s: %v", ip, err)
 			continue
 		}
 		r.turnRoutes = append(r.turnRoutes, ip)
-		log.Printf("[ROUTE] Added TURN route: %s/32 via %s", ip, r.physicalGW)
-	}
-}
-
-// SetupInterface назначает IP-адрес и DNS wintun-интерфейсу через netsh.
-func SetupInterface(ifaceName string, addresses []string, dnsServers []string) error {
-	if len(addresses) == 0 {
-		return fmt.Errorf("no addresses to configure")
-	}
-
-	// Назначаем первый адрес
-	addr := addresses[0]
-	ip, ipNet, err := net.ParseCIDR(addr)
-	if err != nil {
-		return fmt.Errorf("invalid address %q: %w", addr, err)
-	}
-	mask := ipNetMask(ipNet.Mask)
-
-	// Назначаем IP интерфейсу
-	out, err := netsh("interface", "ip", "set", "address",
-		fmt.Sprintf("name=%q", ifaceName), "static", ip.String(), mask, "none")
-	if err != nil {
-		return fmt.Errorf("set address: %w (output: %s)", err, out)
-	}
-
-	// Дополнительные адреса
-	for _, a := range addresses[1:] {
-		ip2, _, err := net.ParseCIDR(a)
-		if err != nil {
-			continue
-		}
-		netsh("interface", "ip", "add", "address",
-			fmt.Sprintf("name=%q", ifaceName), ip2.String())
-	}
-
-	// DNS
-	if len(dnsServers) > 0 {
-		netsh("interface", "ip", "set", "dnsservers",
-			fmt.Sprintf("name=%q", ifaceName), "static", dnsServers[0], "primary")
-		for _, dns := range dnsServers[1:] {
-			netsh("interface", "ip", "add", "dnsservers",
-				fmt.Sprintf("name=%q", ifaceName), dns)
-		}
-	}
-
-	log.Printf("[ROUTE] Interface %q configured: addr=%s dns=%v", ifaceName, addresses[0], dnsServers)
-	return nil
-}
-
-// AddVPNRoutes добавляет маршруты AllowedIPs через wintun-интерфейс.
-func AddVPNRoutes(ifaceName string, allowedIPs []string) error {
-	for _, cidr := range allowedIPs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			log.Printf("[ROUTE] Skipping invalid AllowedIP %q: %v", cidr, err)
-			continue
-		}
-		// netsh interface ip add route <prefix> <interface_name> — interface name is positional
-		out, err := netsh("interface", "ip", "add", "route",
-			ipNet.String(), ifaceName)
-		if err != nil {
-			log.Printf("[ROUTE] Warning: add route %s via %s: %v (%s)", cidr, ifaceName, err, out)
-		} else {
-			log.Printf("[ROUTE] Added VPN route: %s via %s", cidr, ifaceName)
-		}
-	}
-	return nil
-}
-
-// RemoveVPNRoutes удаляет маршруты AllowedIPs.
-func RemoveVPNRoutes(ifaceName string, allowedIPs []string) {
-	for _, cidr := range allowedIPs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		netsh("interface", "ip", "delete", "route",
-			ipNet.String(), ifaceName)
+		log.Printf("[ROUTE] Added TURN route: %s via %s", dst, r.physGW)
 	}
 }
 
 // Cleanup удаляет добавленные TURN host-маршруты.
 func (r *RouteManager) Cleanup() {
 	for _, ip := range r.turnRoutes {
-		if err := r.deleteRoute(ip + "/32"); err != nil {
+		dst := netip.PrefixFrom(ip, ip.BitLen())
+		if err := r.physLUID.DeleteRoute(dst, r.physGW); err != nil {
 			log.Printf("[ROUTE] Warning: cannot remove route for %s: %v", ip, err)
 		} else {
-			log.Printf("[ROUTE] Removed TURN route: %s/32", ip)
+			log.Printf("[ROUTE] Removed TURN route: %s", dst)
 		}
 	}
 	r.turnRoutes = nil
 }
 
-// addRoute добавляет маршрут через netsh / route add.
-func (r *RouteManager) addRoute(cidr, gateway string) error {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return err
+// SetupInterface назначает IP-адреса и DNS wintun-интерфейсу через IP Helper API.
+func SetupInterface(luid winipcfg.LUID, addresses []string, dnsServers []string) error {
+	if len(addresses) == 0 {
+		return fmt.Errorf("no addresses to configure")
 	}
-	// route ADD <network> MASK <mask> <gateway>
-	out, err := runCmd("route", "ADD",
-		ipNet.IP.String(), "MASK", ipNetMask(ipNet.Mask), gateway)
-	if err != nil {
-		return fmt.Errorf("%w (output: %s)", err, out)
+
+	prefixes := make([]netip.Prefix, 0, len(addresses))
+	for _, a := range addresses {
+		p, err := netip.ParsePrefix(a)
+		if err != nil {
+			return fmt.Errorf("invalid address %q: %w", a, err)
+		}
+		prefixes = append(prefixes, p)
+	}
+	if err := luid.SetIPAddresses(prefixes); err != nil {
+		return fmt.Errorf("set ip addresses: %w", err)
+	}
+
+	// DNS назначается отдельно по семействам (IPv4 / IPv6).
+	if len(dnsServers) > 0 {
+		var v4, v6 []netip.Addr
+		for _, d := range dnsServers {
+			a, err := netip.ParseAddr(d)
+			if err != nil {
+				log.Printf("[ROUTE] Skipping invalid DNS %q: %v", d, err)
+				continue
+			}
+			if a.Is4() {
+				v4 = append(v4, a)
+			} else {
+				v6 = append(v6, a)
+			}
+		}
+		if len(v4) > 0 {
+			if err := luid.SetDNS(windows.AF_INET, v4, nil); err != nil {
+				log.Printf("[ROUTE] Warning: set IPv4 DNS: %v", err)
+			}
+		}
+		if len(v6) > 0 {
+			if err := luid.SetDNS(windows.AF_INET6, v6, nil); err != nil {
+				log.Printf("[ROUTE] Warning: set IPv6 DNS: %v", err)
+			}
+		}
+	}
+
+	log.Printf("[ROUTE] Interface configured: addr=%v dns=%v", addresses, dnsServers)
+	return nil
+}
+
+// AddVPNRoutes добавляет маршруты AllowedIPs через wintun-интерфейс (on-link).
+func AddVPNRoutes(luid winipcfg.LUID, allowedIPs []string) error {
+	for _, cidr := range allowedIPs {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			log.Printf("[ROUTE] Skipping invalid AllowedIP %q: %v", cidr, err)
+			continue
+		}
+		dst := p.Masked() // destination маршрута — адрес сети
+		if err := luid.AddRoute(dst, onLinkNextHop(dst), 0); err != nil {
+			log.Printf("[ROUTE] Warning: add route %s: %v", cidr, err)
+		} else {
+			log.Printf("[ROUTE] Added VPN route: %s", dst)
+		}
 	}
 	return nil
 }
 
-func (r *RouteManager) deleteRoute(cidr string) error {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return err
+// RemoveVPNRoutes удаляет маршруты AllowedIPs. При удалении самого wintun-адаптера
+// маршруты исчезают автоматически — этот вызов лишь подстраховка/явная очистка.
+func RemoveVPNRoutes(luid winipcfg.LUID, allowedIPs []string) {
+	for _, cidr := range allowedIPs {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+		dst := p.Masked()
+		luid.DeleteRoute(dst, onLinkNextHop(dst))
 	}
-	_, err = runCmd("route", "DELETE", ipNet.IP.String())
-	return err
 }
 
-// DefaultGateway возвращает IP дефолтного шлюза и IP интерфейса.
-// Использует `route print 0.0.0.0` и парсит вывод.
-func DefaultGateway() (string, string, error) { return defaultGateway() }
-
-func defaultGateway() (string, string, error) {
-	out, err := runCmd("route", "print", "0.0.0.0")
+// DefaultGateway возвращает IP дефолтного шлюза и индекс интерфейса (строкой).
+// Сохранена сигнатура (gateway, iface, err) для совместимости с вызывающим кодом.
+func DefaultGateway() (string, string, error) {
+	gw, _, ifIndex, err := defaultRoute()
 	if err != nil {
 		return "", "", err
 	}
-	// Ищем строку вида: "0.0.0.0  0.0.0.0  <gateway>  <interface>  <metric>"
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[0] == "0.0.0.0" && fields[1] == "0.0.0.0" {
-			gw := fields[2]
-			if net.ParseIP(gw) != nil && gw != "0.0.0.0" {
-				return gw, fields[3], nil
-			}
+	return gw.String(), strconv.FormatUint(uint64(ifIndex), 10), nil
+}
+
+// defaultRoute находит лучший (минимальная метрика) дефолтный маршрут IPv4 с
+// настоящим next-hop'ом, игнорируя on-link маршруты (в т.ч. 0.0.0.0/0 нашего
+// собственного wintun-интерфейса, у которого next-hop неопределён).
+func defaultRoute() (gw netip.Addr, luid winipcfg.LUID, ifIndex uint32, err error) {
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		return netip.Addr{}, 0, 0, fmt.Errorf("get ip forward table: %w", err)
+	}
+	best := -1
+	var bestMetric uint32
+	for i := range rows {
+		p := rows[i].DestinationPrefix.Prefix()
+		if !p.IsValid() || p.Bits() != 0 {
+			continue // не дефолтный маршрут
+		}
+		nh := rows[i].NextHop.Addr()
+		if !nh.IsValid() || nh.IsUnspecified() {
+			continue // on-link (например, наш wintun) — пропускаем
+		}
+		if best == -1 || rows[i].Metric < bestMetric {
+			best = i
+			bestMetric = rows[i].Metric
 		}
 	}
-	return "", "", fmt.Errorf("default gateway not found in route table")
-}
-
-// netsh запускает netsh с аргументами и возвращает вывод.
-func netsh(args ...string) (string, error) {
-	return runCmd("netsh", args...)
-}
-
-func runCmd(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
-// ipNetMask конвертирует net.IPMask в строку вида "255.255.255.0".
-func ipNetMask(mask net.IPMask) string {
-	if len(mask) == 4 {
-		return fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3])
+	if best == -1 {
+		return netip.Addr{}, 0, 0, fmt.Errorf("default gateway not found in route table")
 	}
-	return "255.255.255.0"
+	return rows[best].NextHop.Addr(), rows[best].InterfaceLUID, rows[best].InterfaceIndex, nil
+}
+
+// onLinkNextHop возвращает неопределённый адрес нужного семейства — признак
+// on-link маршрута (трафик уходит прямо в интерфейс, без шлюза).
+func onLinkNextHop(p netip.Prefix) netip.Addr {
+	if p.Addr().Is4() {
+		return netip.IPv4Unspecified()
+	}
+	return netip.IPv6Unspecified()
 }
