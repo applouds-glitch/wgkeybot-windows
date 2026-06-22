@@ -100,6 +100,16 @@ func ResolvedHostIPs() []string {
 	return ips
 }
 
+// NewDnsCache returns a standalone DNS cache that uses the same ordered-server
+// resolution (UDP→DoH→DoT, see resolveWithOrderedServers) as the proxy
+// bootstrap, but with its own cache map. Callers outside the proxy — e.g. the
+// control-plane API client in winbridge — get hardened resolution without
+// sharing the bootstrap cache (hostCache), so their lookups do not leak into
+// ResolvedHostIPs() and trigger spurious bypass-route installation.
+func NewDnsCache() *DnsCache {
+	return &DnsCache{ips: make(map[string]string)}
+}
+
 // Resolve resolves DNS name using cache and ordered server list
 func (c *DnsCache) Resolve(ctx context.Context, domain string) (string, error) {
 	// 1. Check cache

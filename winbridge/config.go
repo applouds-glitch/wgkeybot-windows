@@ -2,6 +2,7 @@ package winbridge
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -231,40 +232,86 @@ func (e *UpgradeRequiredError) Error() string {
 	return "требуется обновление приложения"
 }
 
+// apiResolver резолвит хосты control-plane (key.shadowgate.online) через
+// закалённый резолвер прокси (UDP→DoH→DoT-фолбэк) вместо системного DNS.
+// Это снимает зависимость от роутерного DNS: при его таймауте запрос всё равно
+// уходит на Yandex/Google (в т.ч. поверх DoH/DoT, если UDP/53 режут).
+// Кэш отдельный от bootstrap-кэша прокси — лукапы API не попадают в
+// ResolvedHostIPs() и не порождают лишних bypass-маршрутов.
+var apiResolver = proxy.NewDnsCache()
+
+// apiClient — общий HTTP-клиент для запросов к API. DialContext подменяет
+// резолвинг на apiResolver; TLS (SNI/проверка серта) при этом по-прежнему идёт
+// по имени хоста из URL, а не по IP, потому что http.Transport накладывает TLS
+// поверх уже установленного TCP-соединения.
+var apiClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			// IP-литералы пропускаем как есть — резолвить нечего.
+			if net.ParseIP(host) == nil {
+				ip, rerr := apiResolver.Resolve(ctx, host)
+				if rerr != nil {
+					return nil, fmt.Errorf("resolve %s: %w", host, rerr)
+				}
+				host = ip
+			}
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(host, port))
+		},
+	},
+}
+
 // apiGet выполняет GET-запрос к API с заголовками X-App-Version и Authorization.
+// Транспортные сбои (DNS/dial/TLS/timeout) — транзиентные, поэтому запрос
+// повторяется с коротким backoff. Любой HTTP-ответ (включая 401/426/4xx/5xx)
+// детерминирован и возвращается без ретрая.
 func apiGet(urlStr, accessToken string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-App-Version", strings.SplitN(AppVersion, "-", 2)[0])
-	if accessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+accessToken)
-	}
-
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	switch resp.StatusCode {
-	case http.StatusUnauthorized:
-		return nil, ErrUnauthorized
-	case http.StatusUpgradeRequired:
-		var j struct {
-			DownloadURL string `json:"download_url"`
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, urlStr, nil)
+		if err != nil {
+			return nil, err
 		}
-		json.Unmarshal(body, &j)
-		return nil, &UpgradeRequiredError{DownloadURL: j.DownloadURL}
-	default:
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("сервер вернул %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-App-Version", strings.SplitN(AppVersion, "-", 2)[0])
+		if accessToken != "" {
+			req.Header.Set("Authorization", "Bearer "+accessToken)
 		}
-		return body, nil
+
+		resp, err := apiClient.Do(req)
+		if err != nil {
+			// Транспортный сбой — сервер не ответил. Повторяем (0.5s, 1s).
+			lastErr = err
+			if attempt < maxAttempts {
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			}
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			return nil, ErrUnauthorized
+		case http.StatusUpgradeRequired:
+			var j struct {
+				DownloadURL string `json:"download_url"`
+			}
+			json.Unmarshal(body, &j)
+			return nil, &UpgradeRequiredError{DownloadURL: j.DownloadURL}
+		default:
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return nil, fmt.Errorf("сервер вернул %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			}
+			return body, nil
+		}
 	}
+	return nil, lastErr
 }
 
 // InitFromToken выполняет первичный импорт по одноразовому токену.

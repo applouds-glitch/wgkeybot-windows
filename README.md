@@ -105,6 +105,21 @@ goversioninfo -o rsrc_windows.syso versioninfo.json
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wgkeybot.exe .
 ```
 
+### Иконки
+
+- **Иконка трея** рисуется в рантайме как векторный «ключ» (`assets/key.go`),
+  отдельно от детального арта — на 16px силуэт читается, в отличие от
+  уменьшенной иллюстрации. Состояния: зелёный (подключено), жёлтый
+  (подключение), серый (отключено).
+- **Иконка .exe** — многоразмерный `assets/icon.ico` (16…256), сгенерированный
+  из `assets/icon.png`. Перегенерировать после смены `icon.png`:
+
+  ```bash
+  go run ./cmd/genico                 # пересобрать assets/icon.ico
+  go run ./cmd/genico -preview out    # + PNG-превью трея и иконки в ./out
+  goversioninfo -o rsrc_windows.syso versioninfo.json   # встроить в .syso
+  ```
+
 ## Отказ от ответственности
 
 Автор не несёт ответственности за использование программы. Вы используете её на свой страх и риск.

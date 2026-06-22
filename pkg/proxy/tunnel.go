@@ -204,6 +204,7 @@ func (t *Tunnel) AttachWireGuard(wgCfg WireGuardConfig) error {
 	if mtu == 0 {
 		mtu = 1280
 	}
+	SetWrapMTU(mtu)
 
 	tunDev, err := tun.CreateTUN(name, mtu)
 	if err != nil {
@@ -226,6 +227,7 @@ func (t *Tunnel) AttachWireGuardNetstack(wgCfg WireGuardConfig) (*netstack.Net, 
 	if mtu == 0 {
 		mtu = 1280
 	}
+	SetWrapMTU(mtu)
 
 	localAddrs, err := parseNetipAddrs(wgCfg.Address)
 	if err != nil {
