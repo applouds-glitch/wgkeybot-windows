@@ -9,6 +9,10 @@ type Profile struct {
 	SecChUa         string
 	SecChUaMobile   string
 	SecChUaPlatform string
+	// AcceptLanguage is the Accept-Language header and navigator.language(s)
+	// reported for this profile. A Russian VK user on a desktop device sends
+	// ru-RU; an en-US value paired with a vk.com session is a bot signal.
+	AcceptLanguage string
 }
 
 // profiles contain paired User-Agent and Client Hints strings to harden bot detection.

@@ -38,6 +38,30 @@ var errSliderDetected = errors.New("slider_detected")
 // challenge (slider) should be tried instead.
 var errCaptchaBot = errors.New("captcha_bot")
 
+// errCaptchaRateLimit is returned when VK throttles the captcha endpoint
+// (check status ERROR_LIMIT, or getContent status ERROR/ERROR_LIMIT). The
+// session is spent: retrying or escalating to another auto solver only burns
+// more requests and digs the rate-limit hole deeper, so callers must stop
+// hammering and fall back to the WebView instead.
+var errCaptchaRateLimit = errors.New("captcha_rate_limit")
+
+// isCaptchaSessionExhausted reports whether err means VK has throttled the
+// captcha session (so further auto attempts are pointless). It matches the
+// sentinel as well as the wrapped error strings the slider/checkbox paths
+// produce, since those wrap the underlying status into fmt.Errorf chains.
+func isCaptchaSessionExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errCaptchaRateLimit) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error_limit") ||
+		strings.Contains(msg, "getcontent status:") ||
+		strings.Contains(msg, "rate limit")
+}
+
 // captchaDebugInfoCache caches debug_info strings keyed by script URL so we
 // only fetch the JS once per unique script version.
 var captchaDebugInfoCache sync.Map
@@ -249,6 +273,13 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		}
 		lastErr = err
 		turnLog("[STREAM %d] [Captcha] attempt %d/%d failed: %v", streamID, attempt, maxAttempts, err)
+		// VK has throttled this captcha session: another attempt would only
+		// burn more requests against the rate limit. Stop and let the caller
+		// fall back to the WebView.
+		if isCaptchaSessionExhausted(err) {
+			turnLog("[STREAM %d] [Captcha] Session throttled (ERROR_LIMIT) — abandoning auto solve", streamID)
+			return "", err
+		}
 		if attempt < maxAttempts {
 			backoff := time.Duration(attempt) * 500 * time.Millisecond
 			select {
@@ -286,7 +317,20 @@ func solveVkCaptchaOnce(ctx context.Context, captchaErr *VkCaptchaError, streamI
 		debugInfo = captchaDebugInfo
 	}
 
-	if useSliderPOC {
+	bootstrapHasSlider := false
+	if bootstrap.Settings != nil {
+		_, bootstrapHasSlider = bootstrap.Settings.SettingsByType[sliderCaptchaType]
+	}
+
+	// When VK offers a slider — either this is the explicit slider-POC mode, or
+	// the bootstrap already advertised one — run the unified single-session
+	// solver. It does settings → componentDone → checkbox check → slider on ONE
+	// session_token, escalating to the slider in-place if the checkbox is
+	// rejected as a bot. The old path ran a standalone checkbox solver first and
+	// then spun up a *second* session for the slider, duplicating
+	// settings/componentDone/check on the same token — which tripped VK's
+	// per-token rate limit (ERROR_LIMIT) before the slider image could load.
+	if useSliderPOC || bootstrapHasSlider {
 		successToken, err := callCaptchaNotRobotWithSliderPOC(
 			ctx, captchaErr.SessionToken, hash, debugInfo, streamID, client, profile, bootstrap.Settings,
 		)
@@ -297,28 +341,15 @@ func solveVkCaptchaOnce(ctx context.Context, captchaErr *VkCaptchaError, streamI
 		return successToken, nil
 	}
 
+	// No slider advertised — try the plain checkbox solver. If its own live
+	// settings reveal a slider it returns errSliderDetected, and the caller
+	// (vk.go) re-enters this with useSliderPOC=true for the unified path above.
 	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, debugInfo, streamID, client, profile)
-	if err == nil {
-		turnLog("[STREAM %d] [Captcha] Success! Got success_token", streamID)
-		return successToken, nil
+	if err != nil {
+		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 	}
-
-	// If checkbox returned bot/slider-detected and slider settings exist, try slider
-	if (errors.Is(err, errCaptchaBot) || errors.Is(err, errSliderDetected)) && bootstrap.Settings != nil {
-		if _, hasSlider := bootstrap.Settings.SettingsByType[sliderCaptchaType]; hasSlider {
-			turnLog("[STREAM %d] [Captcha] Checkbox failed (%v) — escalating to slider POC", streamID, err)
-			successToken, sliderErr := callCaptchaNotRobotWithSliderPOC(
-				ctx, captchaErr.SessionToken, hash, debugInfo, streamID, client, profile, bootstrap.Settings,
-			)
-			if sliderErr != nil {
-				return "", fmt.Errorf("captchaNotRobot slider POC failed: %w", sliderErr)
-			}
-			turnLog("[STREAM %d] [Captcha] Success! Got success_token (slider POC after bot escalation)", streamID)
-			return successToken, nil
-		}
-	}
-
-	return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
+	turnLog("[STREAM %d] [Captcha] Success! Got success_token", streamID)
+	return successToken, nil
 }
 
 func applyBrowserProfileFhttp(req *fhttp.Request, profile Profile) {
@@ -326,8 +357,28 @@ func applyBrowserProfileFhttp(req *fhttp.Request, profile Profile) {
 	req.Header.Set("sec-ch-ua", profile.SecChUa)
 	req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
 	req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Language", profileAcceptLanguage(profile))
 	req.Header.Set("DNT", "1")
+}
+
+// profileAcceptLanguage returns the Accept-Language header for a profile,
+// falling back to en-US when the profile predates the AcceptLanguage field.
+func profileAcceptLanguage(profile Profile) string {
+	if strings.TrimSpace(profile.AcceptLanguage) != "" {
+		return profile.AcceptLanguage
+	}
+	return "en-US,en;q=0.9"
+}
+
+// captchaDeviceLanguages mirrors navigator.language / navigator.languages for
+// the device fingerprint. It must stay consistent with the Accept-Language
+// header (profileAcceptLanguage) — a ru-RU header paired with an en-US
+// navigator.language is exactly the inconsistency VK's bot detector flags.
+func captchaDeviceLanguages(profile Profile) (string, string) {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(profile.AcceptLanguage)), "ru") {
+		return "ru-RU", `["ru-RU","ru","en-US"]`
+	}
+	return "en-US", `["en-US"]`
 }
 
 type captchaViewport struct {
@@ -472,11 +523,13 @@ func buildCaptchaDeviceJSON(profile Profile, vp captchaViewport) string {
 	if vp.Width >= 2560 {
 		devicePixelRatio = 2
 	}
+	language, languages := captchaDeviceLanguages(profile)
 
 	return fmt.Sprintf(
-		`{"screenWidth":%d,"screenHeight":%d,"screenAvailWidth":%d,"screenAvailHeight":%d,"innerWidth":%d,"innerHeight":%d,"devicePixelRatio":%d,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":%d,"deviceMemory":%d,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
+		`{"screenWidth":%d,"screenHeight":%d,"screenAvailWidth":%d,"screenAvailHeight":%d,"innerWidth":%d,"innerHeight":%d,"devicePixelRatio":%d,"language":"%s","languages":%s,"webdriver":false,"hardwareConcurrency":%d,"deviceMemory":%d,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
 		vp.Width, vp.Height, vp.Width, availHeight, vp.Width, innerHeight,
 		devicePixelRatio,
+		language, languages,
 		8+rand.Intn(9),  // 8-16 cores
 		8+rand.Intn(25), // 8-32 GB
 		profile.UserAgent,
@@ -525,7 +578,7 @@ func fetchDebugInfoFromScript(ctx context.Context, scriptURL string, client tlsc
 	}
 	applyBrowserProfileFhttp(req, profile)
 	req.Header.Set("Accept", "text/javascript,*/*")
-	req.Header.Set("Referer", "https://id.vk.ru/")
+	req.Header.Set("Referer", "https://id.vk.com/")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
 	req.Header.Set("Sec-Fetch-Mode", "no-cors")
 	req.Header.Set("Sec-Fetch-Dest", "script")
@@ -555,7 +608,7 @@ func fetchDebugInfoFromScript(ctx context.Context, scriptURL string, client tlsc
 
 func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
-		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+		reqURL := "https://api.vk.com/method/" + method + "?v=5.282"
 		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err

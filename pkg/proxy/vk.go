@@ -17,6 +17,7 @@ import (
 	neturl "net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -31,10 +32,15 @@ type VKCredentials struct {
 	ClientSecret string
 }
 
-// Predefined list of VK credentials (tried in order until success)
+// Predefined list of VK credentials, rotated round-robin so one app's
+// rate-limit/rejection doesn't poison every fetch (fallback still tries the rest).
 var vkCredentialsList = []VKCredentials{
 	{ClientID: "6287487", ClientSecret: "QbYic1K3lEV5kTGiqlq2"}, // VK_WEB_APP_ID
+	{ClientID: "8202606", ClientSecret: "lMRsTiMCyPnp5vfoldmn"}, // VK app rotation fallback
 }
+
+// vkCredRotation round-robins the starting credential across fetchVkCreds calls.
+var vkCredRotation atomic.Uint64
 
 // vkRequestMu serializes VK API requests to avoid flood control
 var vkRequestMu sync.Mutex
@@ -226,10 +232,23 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
 		SecChUaMobile:   "?0",
 		SecChUaPlatform: `"Windows"`,
+		AcceptLanguage:  "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+	}
+
+	// Primary path: VK Calls anonymous flow — no captcha. The legacy captcha
+	// chain below stays as insurance for when this flow breaks (VK changes the
+	// messages.* endpoints, or a captcha gate appears even here).
+	if user, pass, addr, lifetime, vkErr := getVKCredsViaVKCalls(ctx, link, client, profile); vkErr == nil {
+		turnLog("[VK Auth] Success via VK Calls anonymous flow (no captcha)")
+		return user, pass, addr, lifetime, nil
+	} else {
+		turnLog("[VK Auth] VK Calls flow failed (%v) — falling back to legacy captcha path", vkErr)
 	}
 
 	var lastErr error
-	for _, creds := range vkCredentialsList {
+	start := int(vkCredRotation.Add(1) - 1)
+	for i := 0; i < len(vkCredentialsList); i++ {
+		creds := vkCredentialsList[(start+i)%len(vkCredentialsList)]
 		user, pass, addrs, lifetime, err := getTokenChain(ctx, link, creds, client, profile)
 		if err == nil {
 			return user, pass, addrs, lifetime, nil
@@ -262,8 +281,8 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 		applyBrowserProfileFhttp(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Origin", "https://vk.ru")
-		req.Header.Set("Referer", "https://vk.ru/")
+		req.Header.Set("Origin", "https://vk.com")
+		req.Header.Set("Referer", "https://vk.com/")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
@@ -295,8 +314,11 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 	escapedName := neturl.QueryEscape(name)
 
 	// Token 1
+	// Keep token_type=messages: VK's scopes variant of get_anonym_token mints an
+	// OAuth-only token that getAnonymousToken rejects with anonym_token.not_found.
+	// Only the host moved to vk.com, not the params.
 	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", creds.ClientID, creds.ClientSecret, creds.ClientID)
-	resp, err := doRequest(data, "https://login.vk.ru/?act=get_anonym_token")
+	resp, err := doRequest(data, "https://login.vk.com/?act=get_anonym_token")
 	if err != nil {
 		turnLog("[VK Auth] Token 1 request failed: %v", err)
 		return "", "", nil, 0, err
@@ -327,7 +349,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 
 	// getCallPreview — имитация поведения VK-клиента перед запросом токена звонка
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
-	_, err = doRequest(data, fmt.Sprintf("https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id=%s", creds.ClientID))
+	_, err = doRequest(data, fmt.Sprintf("https://api.vk.com/method/calls.getCallPreview?v=5.282&client_id=%s", creds.ClientID))
 	if err != nil {
 		turnLog("[VK Auth] getCallPreview warning: %v", err)
 	}
@@ -336,7 +358,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 
 	// Token 2
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
-	urlAddr := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", creds.ClientID)
+	urlAddr := fmt.Sprintf("https://api.vk.com/method/calls.getAnonymousToken?v=5.282&client_id=%s", creds.ClientID)
 
 	enableManual := true
 	// Windows: SolveCaptchaProxy already escalates to a visible dialog on timeout,
