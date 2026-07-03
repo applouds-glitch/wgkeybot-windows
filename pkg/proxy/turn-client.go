@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	"github.com/wgkeybot/windows/pkg/proxy/srtpwrap"
 )
 
 func init() {
@@ -85,6 +86,12 @@ type stream struct {
 	// wrapPacket / unwrapPacket before any DTLS processing.
 	// nil = WRAP disabled (plain mode).
 	wrapKey []byte
+
+	// ssrc is this stream's random RTP SSRC. It is written into every outbound
+	// WRAP header and folded into the ChaCha20 nonce, so each stream (and each
+	// device) uses a distinct keystream even at the same counter. Random per
+	// stream; set at creation in StartTunnelGroups.
+	ssrc uint32
 }
 
 // stunBindingIndication is a minimal STUN Binding Indication (RFC 5389, 20 bytes).
@@ -108,16 +115,97 @@ func isStunKeepalive(b []byte) bool {
 
 const iPacketBuffMaxSize = 2048
 
-// relayIdleTimeout bounds how long a stream may go without ANY packet from the
-// peer before it is torn down and rebuilt by WorkerGroup. The server echoes
-// every STUN keepalive (~25s) straight back to its own stream, so on a healthy
-// relay this deadline is re-armed roughly every 25s; 90s tolerates ~3 lost
-// echoes. It is the only reliable dead-relay detector: pion/turn refreshes the
-// TURN allocation on an internal timer and, when that REFRESH fails, merely
-// logs a warning without closing the conn — so WriteTo keeps "succeeding"
-// (SEND indications are fire-and-forget) and a dead allocation is otherwise
-// invisible to the application.
-const relayIdleTimeout = 90 * time.Second
+// Keepalive cadence. A single per-stream goroutine (runKeepalive) sends the STUN
+// Binding Indication AND runs dead-stream detection, replacing the former 25s
+// Indication ticker + relay read-deadline + optional watchdog. The send interval
+// and dead-stream threshold adapt to app state (see globalIdleFlag):
+//
+//	active — foreground / screen on: fast keepalive, ~35s dead-stream detect.
+//	idle   — screen off / suspend: keepalive relaxes to the NAT-hold floor and
+//	         the detector widens to ~90s, cutting per-stream wakeups ~2.5×.
+//
+// The NAT-hold floor (25s) is the hard ceiling: carrier CGNAT UDP mappings
+// commonly expire in 30-60s, so an idle keepalive must not exceed ~25-30s or the
+// relay path silently dies. Liveness is proved only by a real packet FROM the
+// peer (WG data or the server's echo of our Indication) bumping lastRx in the RX
+// goroutine — a successful send proves nothing (a dead TURN allocation still
+// accepts WriteTo, since SEND indications are fire-and-forget).
+const (
+	kaActiveInterval = 10 * time.Second
+	kaActiveDead     = 35 * time.Second
+	kaIdleInterval   = 25 * time.Second
+	kaIdleDead       = 90 * time.Second
+)
+
+// keepaliveCadence returns the current keepalive send interval and dead-stream
+// detection threshold for the active/idle mode (see globalIdleFlag).
+func keepaliveCadence() (interval, dead time.Duration) {
+	if atomic.LoadInt32(&globalIdleFlag) != 0 {
+		return kaIdleInterval, kaIdleDead
+	}
+	return kaActiveInterval, kaActiveDead
+}
+
+// alignedSleep blocks until the next multiple of interval on a global wall-clock
+// grid (shared by every stream), then reports true; it reports false if ctx is
+// cancelled first. Because all streams align to the same grid with the same
+// interval, their keepalives fire in one coalesced burst — the NIC/radio wakes
+// once per interval instead of once per stream — with no cross-stream coordination.
+func alignedSleep(ctx context.Context, interval time.Duration) bool {
+	next := time.Now().Truncate(interval).Add(interval)
+	t := time.NewTimer(time.Until(next))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// freezeSlack is how far past the requested interval a runKeepalive sleep may run
+// before it is treated as a host freeze (system suspend/sleep) rather than a dead
+// path. On a detected freeze the liveness clock is reset and the stream is NOT
+// torn down — otherwise every stream would tear down on wake and mass-reconnect
+// on one credential, tripping the TURN 486 quota → captcha.
+const freezeSlack = 20 * time.Second
+
+// runKeepalive is the single per-stream keepalive + liveness loop shared by both
+// transports. Each iteration sleeps on the shared aligned grid (coalesced across
+// streams), tears the stream down when no real packet has arrived within the
+// current dead-stream threshold (so WorkerGroup rebuilds it), then emits one
+// keepalive via send. send receives the tick counter (used by NoDTLS to pace
+// cover traffic) and returns any transport write error (logged, non-fatal — only
+// a stale lastRx tears the stream down). Returns when ctx is cancelled or the
+// dead-stream detector fires.
+func (s *stream) runKeepalive(ctx context.Context, lastRx *atomic.Int64, reportErr func(error), send func(tick int) error) {
+	for tick := 0; ; tick++ {
+		interval, dead := keepaliveCadence()
+		before := time.Now()
+		if !alignedSleep(ctx, interval) {
+			return
+		}
+		if slept := time.Since(before); slept > interval+freezeSlack {
+			// The host froze us (system suspend/sleep): lastRx is stale through no
+			// fault of the path. Reset the clock and re-stimulate the path instead
+			// of tearing the stream down on wake.
+			turnLog("[STREAM %d] keepalive: slept %v (freeze) — resetting liveness clock", s.id, slept.Round(time.Second))
+			lastRx.Store(time.Now().Unix())
+			if err := send(tick); err != nil {
+				turnLog("[STREAM %d] keepalive send error: %v", s.id, err)
+			}
+			continue
+		}
+		if time.Since(time.Unix(lastRx.Load(), 0)) > dead {
+			turnLog("[STREAM %d] dead-stream detector: no RX for >%v — closing", s.id, dead)
+			reportErr(fmt.Errorf("dead-stream: no RX for >%v", dead))
+			return
+		}
+		if err := send(tick); err != nil {
+			turnLog("[STREAM %d] keepalive send error: %v", s.id, err)
+		}
+	}
+}
 
 // sendSessionHSBurst sends the 17-byte session header burstCount times
 // with burstGap between sends. The redundancy survives UDP loss and gives
@@ -130,7 +218,7 @@ func (s *stream) sendSessionHSBurst(relayConn net.PacketConn, peer net.Addr, ses
 	for i := 0; i < burstCount; i++ {
 		var payload []byte
 		if hasWrap {
-			enc, err := wrapPacket(s.wrapKey, sessionHS)
+			enc, err := wrapPacket(s.wrapKey, sessionHS, s.ssrc)
 			if err != nil {
 				return fmt.Errorf("session handshake wrap #%d: %w", i+1, err)
 			}
@@ -206,15 +294,13 @@ func (s *stream) runNoDTLS(ctx context.Context, relayConn net.PacketConn, peer *
 	context.AfterFunc(sCtx, func() { relayConn.Close() })
 
 	// lastRx tracks the last sign of life on the relay path — only a real
-	// packet from the peer (WG data or the server's keepalive echo) counts. A
-	// keepalive *send* must never refresh it: a dead TURN allocation still
-	// accepts WriteTo (see relayIdleTimeout), so "sent OK" proves nothing.
+	// packet from the peer (WG data or the server's keepalive echo) counts and
+	// bumps it in the RX goroutine. A keepalive *send* must never refresh it: a
+	// dead TURN allocation still accepts WriteTo (SEND indications are
+	// fire-and-forget), so "sent OK" proves nothing. runKeepalive tears the
+	// stream down once lastRx goes stale past the current dead-stream threshold.
 	var lastRx atomic.Int64
 	lastRx.Store(time.Now().Unix())
-
-	// Arm the dead-relay detector. The RX goroutine re-arms it on every packet
-	// from the peer; the keepalive goroutine deliberately leaves it alone.
-	relayConn.SetReadDeadline(time.Now().Add(relayIdleTimeout))
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -231,7 +317,7 @@ func (s *stream) runNoDTLS(ctx context.Context, relayConn net.PacketConn, peer *
 				var payload []byte
 				if hasWrap {
 					var err error
-					payload, err = wrapPacket(s.wrapKey, b)
+					payload, err = wrapPacket(s.wrapKey, b, s.ssrc)
 					if err != nil {
 						packetPool.Put(b[:cap(b)])
 						noDtlsTxDropCount.Add(1)
@@ -277,10 +363,9 @@ func (s *stream) runNoDTLS(ctx context.Context, relayConn net.PacketConn, peer *
 				continue
 			}
 			// A real packet from the peer is the only proof the relay path is
-			// alive — record it and re-arm the dead-relay deadline. Covers both
-			// WG data and the server's STUN-keepalive echo.
+			// alive — record it so runKeepalive's dead-stream detector holds off.
+			// Covers both WG data and the server's STUN-keepalive echo.
 			lastRx.Store(time.Now().Unix())
-			relayConn.SetReadDeadline(time.Now().Add(relayIdleTimeout))
 			a := s.peer.Load()
 			if a == nil {
 				continue
@@ -315,88 +400,43 @@ func (s *stream) runNoDTLS(ctx context.Context, relayConn net.PacketConn, peer *
 		}
 	}()
 
-	// Keepalive + cover traffic
+	// Keepalive + cover traffic + dead-stream detection (one coalesced,
+	// app-state-adaptive loop; see runKeepalive). Sends the STUN Indication
+	// (liveness stimulus + NAT hold), paces WRAP cover traffic every 3rd tick,
+	// and re-announces the 17-byte session header so a restarted server re-adopts
+	// this stream within one tick without a reconnect. A send never refreshes
+	// lastRx — only the server's echo (in the RX goroutine) proves the path.
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(25 * time.Second)
-		defer ticker.Stop()
-		var tickCount int
-		for {
-			select {
-			case <-sCtx.Done():
-				return
-			case <-ticker.C:
-				// Send the keepalive but do NOT touch the relay read deadline
-				// or lastRx here. Over a dead TURN allocation WriteTo still
-				// returns nil (the SEND indication is fire-and-forget and the
-				// underlying TCP stays up), so a successful send is no proof of
-				// life. Liveness is recorded only when the server's echo of this
-				// keepalive actually comes back (see the RX goroutine).
-				var sendErr error
-				if hasWrap {
-					enc, err := wrapPacket(s.wrapKey, stunBindingIndication)
-					if err == nil {
-						_, sendErr = relayConn.WriteTo(enc, peer)
-					} else {
-						sendErr = err
+		defer sCancel()
+		s.runKeepalive(sCtx, &lastRx, reportErr, func(tick int) error {
+			var sendErr error
+			if hasWrap {
+				if enc, err := wrapPacket(s.wrapKey, stunBindingIndication, s.ssrc); err == nil {
+					_, sendErr = relayConn.WriteTo(enc, peer)
+				} else {
+					sendErr = err
+				}
+				if tick%3 == 0 {
+					if cover, cErr := wrapCoverPacket(s.wrapKey, s.ssrc); cErr == nil {
+						relayConn.WriteTo(cover, peer)
 					}
-					if tickCount%3 == 0 {
-						if cover, cErr := wrapCoverPacket(s.wrapKey); cErr == nil {
-							relayConn.WriteTo(cover, peer)
-						}
+				}
+			} else {
+				_, sendErr = relayConn.WriteTo(stunBindingIndication, peer)
+			}
+			if sessionHS != nil {
+				if hasWrap {
+					if enc, wErr := wrapPacket(s.wrapKey, sessionHS, s.ssrc); wErr == nil {
+						relayConn.WriteTo(enc, peer)
 					}
 				} else {
-					_, sendErr = relayConn.WriteTo(stunBindingIndication, peer)
+					relayConn.WriteTo(sessionHS, peer)
 				}
-				if sendErr != nil {
-					turnLog("[STREAM %d] keepalive send error: %v", s.id, sendErr)
-				}
-				// Re-announce the 17-byte session header. If the server was
-				// restarted it lost all session state and otherwise never
-				// learns this stream again — re-sending lets it re-adopt the
-				// stream within one tick, with no reconnect. On a live stream
-				// the server just forwards it to WireGuard, which drops it.
-				if sessionHS != nil {
-					if hasWrap {
-						if enc, wErr := wrapPacket(s.wrapKey, sessionHS); wErr == nil {
-							relayConn.WriteTo(enc, peer)
-						}
-					} else {
-						relayConn.WriteTo(sessionHS, peer)
-					}
-				}
-				tickCount++
 			}
-		}
+			return sendErr
+		})
 	}()
-
-	// RX watchdog (belt-and-suspenders with relayIdleTimeout): tears the stream
-	// down if no real peer packet has been seen for watchdogTimeout seconds, so
-	// a silently broken path is rebuilt by WorkerGroup instead of hanging. Since
-	// lastRx now tracks only genuine RX, this fires correctly even on a dead
-	// relay; relayIdleTimeout is the always-on detector when watchdog is off.
-	if s.watchdogTimeout > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer sCancel()
-			interval := time.Duration(s.watchdogTimeout) * time.Second
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-sCtx.Done():
-					return
-				case <-ticker.C:
-					if time.Since(time.Unix(lastRx.Load(), 0)) > interval {
-						turnLog("[STREAM %d] RX watchdog: no data for %ds — closing", s.id, s.watchdogTimeout)
-						reportErr(fmt.Errorf("RX watchdog: no data for %ds", s.watchdogTimeout))
-						return
-					}
-				}
-			}
-		}()
-	}
 
 	// Give the server a moment to process the session handshake before
 	// we mark the stream as ready. Reduced from 300ms because the burst
@@ -466,11 +506,10 @@ func (s *stream) runDTLS(ctx context.Context, relayConn net.PacketConn, peer *ne
 		c1.Close()
 	})
 
-	// Arm the dead-relay detector before the relay RX goroutine starts. It is
-	// re-armed on every packet from the peer (handshake records, DTLS app data,
-	// and the server's STUN-keepalive echo) and is the only thing that notices a
-	// silently dead TURN allocation. See relayIdleTimeout.
-	relayConn.SetReadDeadline(time.Now().Add(relayIdleTimeout))
+	// Dead-stream detection lives in runKeepalive below: it watches lastRx (bumped
+	// by the DTLS→WireGuard RX goroutine on every decrypted packet, including the
+	// server's keepalive echo) and, when it goes stale, cancels sCtx — which the
+	// AfterFunc above turns into relayConn.Close(), unblocking this relay RX.
 
 	// ── Pipe → Relay (TX) ────────────────────────────────────────────────────
 	// When WRAP is enabled, each outgoing DTLS record is encrypted with
@@ -487,7 +526,7 @@ func (s *stream) runDTLS(ctx context.Context, relayConn net.PacketConn, peer *ne
 
 			var payload []byte
 			if s.wrapKey != nil {
-				payload, err = wrapPacket(s.wrapKey, buf[:n])
+				payload, err = wrapPacket(s.wrapKey, buf[:n], s.ssrc)
 				if err != nil {
 					turnLog("[STREAM %d] WRAP TX error: %v", s.id, err)
 					relayTxErrorCount.Add(1)
@@ -530,10 +569,6 @@ func (s *stream) runDTLS(ctx context.Context, relayConn net.PacketConn, peer *ne
 				return
 			}
 			if from.String() == peer.String() {
-				// Any packet from the peer proves the relay round-trip works —
-				// re-arm the dead-relay deadline (covers handshake records, DTLS
-				// app data and the keepalive echo).
-				relayConn.SetReadDeadline(time.Now().Add(relayIdleTimeout))
 				var data []byte
 				if s.wrapKey != nil {
 					m, unwrapErr := unwrapPacket(s.wrapKey, wire[:n], plain)
@@ -603,13 +638,6 @@ func (s *stream) runDTLS(ctx context.Context, relayConn net.PacketConn, peer *ne
 			case <-sCtx.Done():
 				return
 			case b := <-s.in:
-				if s.watchdogTimeout > 0 && time.Since(time.Unix(lastRx.Load(), 0)) > time.Duration(s.watchdogTimeout)*time.Second {
-					packetPool.Put(b[:cap(b)])
-					dtlsTxDropCount.Add(1)
-					turnLog("[STREAM %d] TX watchdog (%ds)", s.id, s.watchdogTimeout)
-					reportErr(fmt.Errorf("TX watchdog: no RX for %ds", s.watchdogTimeout))
-					return
-				}
 				_, err := dtlsConn.Write(b)
 				packetPool.Put(b[:cap(b)])
 				if err != nil {
@@ -647,62 +675,165 @@ func (s *stream) runDTLS(ctx context.Context, relayConn net.PacketConn, peer *ne
 		}
 	}()
 
-	// Keepalive: send STUN Binding Indication through DTLS every 25s.
-	// Going via dtlsConn.Write (not raw relayConn.WriteTo) means the server
-	// receives a valid DTLS ApplicationData record → its 5-min read deadline
-	// is refreshed. Raw STUN sent via relayConn would arrive as a non-DTLS UDP
-	// datagram and be silently discarded by pion/dtls, leaving the deadline stale.
-	// The server echoes the 20 bytes straight back through this DTLS stream; the
-	// echo re-arms the relay deadline in the RX goroutine (proof of a live path).
+	// Keepalive + dead-stream detection (one coalesced, app-state-adaptive loop;
+	// see runKeepalive). The STUN Indication goes via dtlsConn.Write so the server
+	// receives a valid DTLS ApplicationData record (refreshing its 5-min read
+	// deadline) and echoes the 20 bytes straight back through this stream; the
+	// echo bumps lastRx in the DTLS→WireGuard RX goroutine — the only proof of a
+	// live path (a dead allocation still accepts the write). runKeepalive tears
+	// the stream down when lastRx goes stale past the current dead-stream
+	// threshold, replacing the former relay read-deadline and watchdog.
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(25 * time.Second)
-		defer ticker.Stop()
+		defer sCancel()
+		s.runKeepalive(sCtx, &lastRx, reportErr, func(int) error {
+			_, err := dtlsConn.Write(stunBindingIndication)
+			return err
+		})
+	}()
+
+	wg.Wait()
+	select {
+	case err := <-firstErr:
+		return err
+	default:
+		return nil
+	}
+}
+
+// runSRTP — DTLS-SRTP transport (peer-type "srtp", VP8-mimic).
+//
+// Structurally a sibling of runDTLS, but the relay TX/RX + DTLS pipework is
+// owned by srtpwrap.Client: it terminates a DTLS-SRTP session over the TURN
+// relay and returns a net.Conn where each Write frames one payload as an
+// RTP+SRTP packet (PayloadType 100 — looks like VP8 WebRTC video to VK's
+// content classifier) and each Read returns one decrypted payload. WRAP is
+// not used here — SRTP already encrypts. The session/stream multiplexing
+// model is preserved exactly: the 17-byte session header is sent first, so
+// the server aggregates this stream's sibling SRTP sessions onto one
+// WireGuard backend conn.
+func (s *stream) runSRTP(ctx context.Context, relayConn net.PacketConn, peer *net.UDPAddr) error {
+	sCtx, sCancel := context.WithCancel(ctx)
+	defer sCancel()
+
+	// firstErr captures the root cause when a goroutine fails and calls sCancel().
+	// See runDTLS for the full rationale (nil return would be misread by
+	// WorkerGroup as "server closed stream, rotate credentials").
+	firstErr := make(chan error, 1)
+	reportErr := func(err error) {
+		select {
+		case firstErr <- err:
+		default:
+		}
+	}
+
+	// srtpwrap.Client owns the relayConn read loop internally; closing the
+	// relay on ctx cancel unblocks it so the session tears down cleanly.
+	context.AfterFunc(sCtx, func() { relayConn.Close() })
+
+	turnLog("[STREAM %d] SRTP handshake...", s.id)
+	hsCtx, hsCancel := context.WithTimeout(sCtx, 30*time.Second)
+	srtpConn, err := srtpwrap.Client(hsCtx, relayConn, peer)
+	hsCancel()
+	if err != nil {
+		return fmt.Errorf("SRTP handshake failed: %w", err)
+	}
+	defer srtpConn.Close()
+	context.AfterFunc(sCtx, func() { srtpConn.Close() })
+	turnLog("[STREAM %d] SRTP handshake OK", s.id)
+
+	// Session + stream ID handshake (proxy_v2 model). Sent as a small burst
+	// for the same reason as runDTLS — the server parses the session ID on the
+	// first payload; duplicates after the first are skipped server-side
+	// (17-byte filter).
+	{
+		srtpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 17)
+		copy(buf[:16], s.sessionID)
+		buf[16] = byte(s.id)
+		const burstCount = 3
+		const burstGap = 50 * time.Millisecond
+		for i := 0; i < burstCount; i++ {
+			if _, err := srtpConn.Write(buf); err != nil {
+				return fmt.Errorf("session handshake send #%d: %w", i+1, err)
+			}
+			if i < burstCount-1 {
+				time.Sleep(burstGap)
+			}
+		}
+		srtpConn.SetWriteDeadline(time.Time{})
+	}
+
+	s.ready.Store(true)
+	s.okFunc()
+
+	var lastRx atomic.Int64
+	lastRx.Store(time.Now().Unix())
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// WireGuard → SRTP (TX)
+	go func() {
+		defer wg.Done()
+		defer sCancel()
 		for {
 			select {
 			case <-sCtx.Done():
 				return
-			case <-ticker.C:
-				// Send the keepalive but do NOT touch the relay deadline or
-				// lastRx here. dtlsConn.Write succeeds even over a dead TURN
-				// allocation (it becomes a fire-and-forget SEND indication on a
-				// still-open TCP conn), so a successful write is no proof of
-				// life. The server echoes this keepalive back through the relay;
-				// that echo is what re-arms the deadline and lastRx in the RX
-				// goroutines. With many streams the server round-robins real WG
-				// responses, so the per-stream echo is the only signal a mostly
-				// idle stream gets.
-				if _, err := dtlsConn.Write(stunBindingIndication); err != nil {
-					turnLog("[STREAM %d] keepalive write error: %v", s.id, err)
+			case b := <-s.in:
+				srtpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_, err := srtpConn.Write(b)
+				packetPool.Put(b[:cap(b)])
+				if err != nil {
+					dtlsTxDropCount.Add(1)
+					reportErr(fmt.Errorf("SRTP write: %w", err))
+					return
 				}
 			}
 		}
 	}()
 
-	// Timer watchdog: closes the stream if no data has been received for watchdogTimeout seconds,
-	// even when there is no outgoing WireGuard traffic (idle connection broken detection).
-	if s.watchdogTimeout > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer sCancel()
-			interval := time.Duration(s.watchdogTimeout) * time.Second
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-sCtx.Done():
+	// SRTP → WireGuard (RX)
+	go func() {
+		defer wg.Done()
+		defer sCancel()
+		buf := make([]byte, iPacketBuffMaxSize)
+		for {
+			n, err := srtpConn.Read(buf)
+			if err != nil {
+				dtlsRxErrorCount.Add(1)
+				reportErr(fmt.Errorf("SRTP read: %w", err))
+				return
+			}
+			lastRx.Store(time.Now().Unix())
+			if isStunKeepalive(buf[:n]) {
+				continue // keepalive echo: liveness recorded, don't feed it to WG
+			}
+			if a := s.peer.Load(); a != nil {
+				if _, err := s.out.WriteTo(buf[:n], *a); err != nil {
+					dtlsRxErrorCount.Add(1)
+					reportErr(fmt.Errorf("TUN write: %w", err))
 					return
-				case <-ticker.C:
-					if time.Since(time.Unix(lastRx.Load(), 0)) > interval {
-						turnLog("[STREAM %d] RX watchdog: no data for %ds — closing", s.id, s.watchdogTimeout)
-						reportErr(fmt.Errorf("RX watchdog: no data for %ds", s.watchdogTimeout))
-						return
-					}
 				}
 			}
-		}()
-	}
+		}
+	}()
+
+	// Keepalive + dead-stream detection (one coalesced, app-state-adaptive loop;
+	// see runKeepalive). The STUN Indication goes through the SRTP pipe; the
+	// server echoes it back through this stream and the echo bumps lastRx in the
+	// SRTP→WireGuard RX goroutine — the only proof of a live path. runKeepalive
+	// tears the stream down when lastRx goes stale. (srtpwrap owns the relay read
+	// loop, so this per-stream detector is the only dead-path signal SRTP has.)
+	go func() {
+		defer wg.Done()
+		defer sCancel()
+		s.runKeepalive(sCtx, &lastRx, reportErr, func(int) error {
+			_, err := srtpConn.Write(stunBindingIndication)
+			return err
+		})
+	}()
 
 	wg.Wait()
 	select {
@@ -729,6 +860,18 @@ var globalPauseFlag int32
 func SetPauseFlag(flag int32) {
 	atomic.StoreInt32(&globalPauseFlag, flag)
 	turnLog("[PROXY] PauseFlag=%d", flag)
+}
+
+// globalIdleFlag — при 1 keepalive стримов расслабляется до NAT-floor, а
+// dead-stream detector расширяется (экономия wakeups без разрыва туннеля). См.
+// keepaliveCadence. По умолчанию 0 (fast/active) — безопасный дефолт.
+var globalIdleFlag int32
+
+// SetIdleMode — внешний API: 1 когда экран погас / система в suspend, 0 когда
+// активна. Вызывается bridge-слоем из событий питания/сессии Windows.
+func SetIdleMode(idle int32) {
+	atomic.StoreInt32(&globalIdleFlag, idle)
+	turnLog("[PROXY] IdleMode=%d", idle)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -775,6 +918,7 @@ type StartProxyParams struct {
 func StartProxy(p StartProxyParams) int32 {
 	clearTransientState()                  // flush DNS + HTTP without clearing credential caches
 	atomic.StoreInt32(&globalPauseFlag, 0) // reset on each new tunnel start
+	atomic.StoreInt32(&globalIdleFlag, 0)  // start in fast/active keepalive cadence
 
 	if len(p.SystemDNS) > 0 {
 		InitSystemDns(p.SystemDNS)
