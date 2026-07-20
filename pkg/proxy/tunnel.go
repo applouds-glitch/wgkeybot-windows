@@ -25,6 +25,10 @@ const (
 	ReadyStatusOK              ReadyStatus = 0
 	ReadyStatusCaptchaRequired ReadyStatus = 1
 	ReadyStatusAuthRequired    ReadyStatus = 2
+	// ReadyStatusCallUnavailable — VK-звонок завершён/удалён или ссылка
+	// недействительна. Terminal: ни captcha, ни ретраи не помогут — нужна
+	// новая ссылка (новый конфиг).
+	ReadyStatusCallUnavailable ReadyStatus = 3
 )
 
 // Config — параметры TURN-прокси + WireGuard для Windows-клиента.
@@ -185,6 +189,9 @@ func (t *Tunnel) WaitReady(timeout time.Duration) ReadyStatus {
 	t.mu.RUnlock()
 	if rc == -2 {
 		return ReadyStatusAuthRequired
+	}
+	if rc == -4 {
+		return ReadyStatusCallUnavailable
 	}
 	if rc != 0 {
 		return ReadyStatusError

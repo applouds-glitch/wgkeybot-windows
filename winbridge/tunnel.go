@@ -178,6 +178,8 @@ func (m *Manager) Connect(ctx context.Context) error {
 			// Continue loop: pkg/proxy may request another captcha (next solve mode).
 		case proxy.ReadyStatusAuthRequired:
 			return fmt.Errorf("VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»")
+		case proxy.ReadyStatusCallUnavailable:
+			return fmt.Errorf("VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг")
 		default:
 			return fmt.Errorf("TURN proxy failed (status %d)", status)
 		}

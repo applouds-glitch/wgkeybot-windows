@@ -220,6 +220,9 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
 		tlsclient.WithDialer(getCustomNetDialer()),
 		tlsclient.WithDialContext(getCustomDialContext),
+		// Additive trust: system CAs + bundled Минцифры chain, in case VK/OK
+		// migrate onto Russian roots (see vk_certs.go).
+		tlsclient.WithTransportOptions(&tlsclient.TransportOptions{RootCAs: vkRootCAPool()}),
 	)
 
 	if err != nil {
@@ -241,6 +244,12 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 	if user, pass, addr, lifetime, vkErr := getVKCredsViaVKCalls(ctx, link, client, profile); vkErr == nil {
 		turnLog("[VK Auth] Success via VK Calls anonymous flow (no captcha)")
 		return user, pass, addr, lifetime, nil
+	} else if isCallUnavailable(vkErr) {
+		// Dead/deleted call or invalid join link. The legacy captcha chain below
+		// would burn credentials and prompt the user for a captcha that can never
+		// resolve a call that no longer exists — surface as terminal instead.
+		turnLog("[VK Auth] VK Calls: call unavailable (%v) — not falling back to legacy", vkErr)
+		return "", "", nil, 0, vkErr
 	} else {
 		turnLog("[VK Auth] VK Calls flow failed (%v) — falling back to legacy captcha path", vkErr)
 	}
@@ -252,6 +261,12 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 		user, pass, addrs, lifetime, err := getTokenChain(ctx, link, creds, client, profile)
 		if err == nil {
 			return user, pass, addrs, lifetime, nil
+		}
+		if isCallUnavailable(err) {
+			// The call itself is gone — rotating to another credential slot would
+			// hit the same dead call. Stop and surface as terminal.
+			turnLog("[VK Auth] Legacy: call unavailable (%v) — not rotating credentials", err)
+			return "", "", nil, 0, err
 		}
 		lastErr = err
 		if strings.Contains(err.Error(), "error_code:29") || strings.Contains(err.Error(), "Rate limit") {
@@ -400,6 +415,15 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 			}
 			if errCode, ok2 := errObj["error_code"].(float64); ok2 && int(errCode) == 9005 {
 				return "", "", nil, 0, fmt.Errorf("CALL_REQUIRES_AUTH")
+			}
+			// Other 9xxx call-domain errors on getAnonymousToken mean the call is
+			// gone (ended/deleted) or the join link is invalid — terminal, no
+			// captcha or credential rotation recovers it. 9005 above is the one
+			// exception (needs a logged-in account, handled distinctly).
+			if errCode, ok2 := errObj["error_code"].(float64); ok2 {
+				if c := int(errCode); c >= 9000 && c <= 9999 {
+					return "", "", nil, 0, callUnavailablef("legacy getAnonymousToken: VK call unavailable (error_code %d)", c)
+				}
 			}
 			if captchaErr != nil && captchaErr.IsCaptchaError() {
 				// Cached token was rejected — invalidate and retry from base data.

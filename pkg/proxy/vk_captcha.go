@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	neturl "net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,7 +40,8 @@ var errSliderDetected = errors.New("slider_detected")
 var errCaptchaBot = errors.New("captcha_bot")
 
 // errCaptchaRateLimit is returned when VK throttles the captcha endpoint
-// (check status ERROR_LIMIT, or getContent status ERROR/ERROR_LIMIT). The
+// (check or getContent status ERROR_LIMIT). A generic ERROR is kept distinct:
+// it may indicate an invalid captcha state or request rather than throttling. The
 // session is spent: retrying or escalating to another auto solver only burns
 // more requests and digs the rate-limit hole deeper, so callers must stop
 // hammering and fall back to the WebView instead.
@@ -58,7 +60,7 @@ func isCaptchaSessionExhausted(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "error_limit") ||
-		strings.Contains(msg, "getcontent status:") ||
+		strings.Contains(msg, "captcha_rate_limit") ||
 		strings.Contains(msg, "rate limit")
 }
 
@@ -80,6 +82,59 @@ var captchaHeaderOrder = []string{
 	"sec-fetch-dest", "referer", "accept-encoding", "priority",
 }
 var captchaPHeaderOrder = []string{":method", ":path", ":authority", ":scheme"}
+
+const captchaNotRobotAPIVersion = "5.131"
+
+var captchaFormFieldOrder = map[string][]string{
+	"captchaNotRobot.settings": {
+		"session_token", "domain", "adFp", "access_token",
+	},
+	"captchaNotRobot.componentDone": {
+		"session_token", "domain", "adFp", "browser_fp", "device", "access_token",
+	},
+	"captchaNotRobot.check": {
+		"session_token", "domain", "adFp", "accelerometer", "gyroscope", "motion",
+		"cursor", "taps", "connectionRtt", "connectionDownlink", "browser_fp",
+		"hash", "answer", "debug_info", "access_token",
+	},
+	"captchaNotRobot.getContent": {
+		"session_token", "domain", "adFp", "captcha_settings", "access_token",
+	},
+	"captchaNotRobot.endSession": {
+		"session_token", "domain", "adFp", "access_token",
+	},
+}
+
+// encodeCaptchaForm preserves the field order emitted by the VK captcha page.
+// net/url.Values.Encode sorts keys alphabetically, which does not match the
+// captured browser requests and creates an avoidable fingerprint difference.
+func encodeCaptchaForm(method string, values neturl.Values) string {
+	orderedKeys := captchaFormFieldOrder[method]
+	seen := make(map[string]bool, len(values))
+	parts := make([]string, 0, len(values))
+	appendKey := func(key string) {
+		for _, value := range values[key] {
+			parts = append(parts, neturl.QueryEscape(key)+"="+neturl.QueryEscape(value))
+		}
+		seen[key] = true
+	}
+	for _, key := range orderedKeys {
+		if _, ok := values[key]; ok {
+			appendKey(key)
+		}
+	}
+	remaining := make([]string, 0, len(values)-len(seen))
+	for key := range values {
+		if !seen[key] {
+			remaining = append(remaining, key)
+		}
+	}
+	sort.Strings(remaining)
+	for _, key := range remaining {
+		appendKey(key)
+	}
+	return strings.Join(parts, "&")
+}
 
 type VkCaptchaError struct {
 	ErrorCode               int
@@ -264,7 +319,10 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		return "", fmt.Errorf("no redirect_uri for auto-solve")
 	}
 
-	const maxAttempts = 2
+	// Live diagnostics showed that a second check with the same session_token
+	// immediately returns ERROR_LIMIT after the first BOT/getContent refusal.
+	// A captcha session is therefore single-use for automatic solving.
+	const maxAttempts = 1
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		token, err := solveVkCaptchaOnce(ctx, captchaErr, streamID, client, profile, useSliderPOC)
@@ -289,7 +347,10 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 			}
 		}
 	}
-	return "", fmt.Errorf("captcha attempts exhausted: %w", lastErr)
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("captcha attempts exhausted")
 }
 
 func solveVkCaptchaOnce(ctx context.Context, captchaErr *VkCaptchaError, streamID int, client tlsclient.HttpClient, profile Profile, useSliderPOC bool) (string, error) {
@@ -435,48 +496,16 @@ func generateHumanCursor() string {
 	return "[" + strings.Join(points, ",") + "]"
 }
 
-// generateSensorNoise produces realistic accelerometer/gyroscope noise.
-func generateSensorNoise() string {
-	// Accelerometer: tiny random values around zero (gravity compensated)
-	accelPoints := make([]string, 8+rand.Intn(6))
-	for i := range accelPoints {
-		accelPoints[i] = fmt.Sprintf(`{"x":%.4f,"y":%.4f,"z":%.4f}`,
-			(rand.Float64()-0.5)*0.04, // ±0.02g
-			(rand.Float64()-0.5)*0.04,
-			1.0+(rand.Float64()-0.5)*0.03) // ~1g gravity ± noise
-	}
-	return "[" + strings.Join(accelPoints, ",") + "]"
-}
-
-func generateGyroNoise() string {
-	// Gyroscope: tiny rotation rates
-	points := make([]string, 8+rand.Intn(6))
-	for i := range points {
-		points[i] = fmt.Sprintf(`{"x":%.4f,"y":%.4f,"z":%.4f}`,
-			(rand.Float64()-0.5)*0.02,
-			(rand.Float64()-0.5)*0.02,
-			(rand.Float64()-0.5)*0.02)
-	}
-	return "[" + strings.Join(points, ",") + "]"
-}
-
-// generateConnectionMetrics produces realistic network metrics with natural variance.
+// generateConnectionMetrics mirrors the captured captcha-page requests: RTT was
+// unavailable, while NetworkInformation.downlink was sampled repeatedly at a
+// fixed value during the page lifetime (22 and 30 samples respectively).
 func generateConnectionMetrics() (rtt string, downlink string) {
-	rttValues := make([]string, 10)
-	for i := range rttValues {
-		// 45-85ms with occasional spike
-		base := 45 + rand.Intn(40)
-		if rand.Intn(10) == 0 {
-			base += rand.Intn(40) // spike up to 125ms
-		}
-		rttValues[i] = strconv.Itoa(base)
-	}
-	rtt = "[" + strings.Join(rttValues, ",") + "]"
-
-	dlValues := make([]string, 16)
+	rtt = "[]"
+	dlValues := make([]string, 22+rand.Intn(9))
+	value := math.Round((8.0+rand.Float64()*2.5)*10) / 10
+	formatted := strconv.FormatFloat(value, 'f', -1, 64)
 	for i := range dlValues {
-		base := 7.5 + rand.Float64()*7.0 // 7.5-14.5 Mbps
-		dlValues[i] = fmt.Sprintf("%.1f", math.Round(base*10)/10)
+		dlValues[i] = formatted
 	}
 	downlink = "[" + strings.Join(dlValues, ",") + "]"
 	return
@@ -525,14 +554,22 @@ func buildCaptchaDeviceJSON(profile Profile, vp captchaViewport) string {
 	}
 	language, languages := captchaDeviceLanguages(profile)
 
+	// navigator.platform must agree with the profile's UA and client hints — a
+	// macOS UA reporting "Win32" is a bot signal on its own.
+	platform := profile.Platform
+	if platform == "" {
+		platform = "Win32"
+	}
+
 	return fmt.Sprintf(
-		`{"screenWidth":%d,"screenHeight":%d,"screenAvailWidth":%d,"screenAvailHeight":%d,"innerWidth":%d,"innerHeight":%d,"devicePixelRatio":%d,"language":"%s","languages":%s,"webdriver":false,"hardwareConcurrency":%d,"deviceMemory":%d,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
+		`{"screenWidth":%d,"screenHeight":%d,"screenAvailWidth":%d,"screenAvailHeight":%d,"innerWidth":%d,"innerHeight":%d,"devicePixelRatio":%d,"language":"%s","languages":%s,"webdriver":false,"hardwareConcurrency":%d,"deviceMemory":%d,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"%s"}`,
 		vp.Width, vp.Height, vp.Width, availHeight, vp.Width, innerHeight,
 		devicePixelRatio,
 		language, languages,
 		8+rand.Intn(9),  // 8-16 cores
 		8+rand.Intn(25), // 8-32 GB
 		profile.UserAgent,
+		platform,
 	)
 }
 
@@ -607,9 +644,9 @@ func fetchDebugInfoFromScript(ctx context.Context, scriptURL string, client tlsc
 }
 
 func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
-	vkReq := func(method string, postData string) (map[string]interface{}, error) {
-		reqURL := "https://api.vk.com/method/" + method + "?v=5.282"
-		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
+	vkReq := func(method string, values neturl.Values) (map[string]interface{}, error) {
+		reqURL := "https://api.vk.com/method/" + method + "?v=" + captchaNotRobotAPIVersion
+		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(encodeCaptchaForm(method, values)))
 		if err != nil {
 			return nil, err
 		}
@@ -643,10 +680,17 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo stri
 	}
 
 	vp := randomViewport()
-	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=&access_token=", neturl.QueryEscape(sessionToken))
+	baseValues := func() neturl.Values {
+		values := neturl.Values{}
+		values.Set("session_token", sessionToken)
+		values.Set("domain", "vk.com")
+		values.Set("adFp", "")
+		values.Set("access_token", "")
+		return values
+	}
 
 	turnLog("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
-	settingsResp, err := vkReq("captchaNotRobot.settings", baseParams)
+	settingsResp, err := vkReq("captchaNotRobot.settings", baseValues())
 	if err != nil {
 		return "", fmt.Errorf("settings failed: %w", err)
 	}
@@ -657,34 +701,41 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo stri
 		}
 	}
 
-	time.Sleep(time.Duration(180+rand.Intn(80)) * time.Millisecond)
+	time.Sleep(time.Duration(500+rand.Intn(300)) * time.Millisecond)
 
 	turnLog("[STREAM %d] [Captcha] Step 2/4: componentDone (viewport=%dx%d)", streamID, vp.Width, vp.Height)
 	browserFp := generateBrowserFp(profile, vp)
 	deviceJSON := buildCaptchaDeviceJSON(profile, vp)
-	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, neturl.QueryEscape(deviceJSON))
+	componentDoneData := baseValues()
+	componentDoneData.Set("browser_fp", browserFp)
+	componentDoneData.Set("device", deviceJSON)
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
 		return "", fmt.Errorf("componentDone failed: %w", err)
 	}
 
-	time.Sleep(time.Duration(180+rand.Intn(80)) * time.Millisecond)
+	time.Sleep(time.Duration(500+rand.Intn(300)) * time.Millisecond)
 
 	turnLog("[STREAM %d] [Captcha] Step 3/4: check", streamID)
-	cursorJSON := generateHumanCursor()
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 
-	accelJSON := generateSensorNoise()
-	gyroJSON := generateGyroNoise()
 	connRtt, connDownlink := generateConnectionMetrics()
-
-	checkData := baseParams + fmt.Sprintf(
-		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
-		neturl.QueryEscape(accelJSON), neturl.QueryEscape(gyroJSON), neturl.QueryEscape("[]"),
-		neturl.QueryEscape(cursorJSON), neturl.QueryEscape("[]"), neturl.QueryEscape(connRtt),
-		neturl.QueryEscape(connDownlink),
-		browserFp, hash, answer, debugInfo,
-	)
+	checkData := baseValues()
+	// Desktop profile: no motion sensors exist, so the sensor arrays stay empty
+	// (a desktop UA paired with accelerometer/gyroscope readings is a stronger
+	// bot signal than their absence). The mouse trajectory is the desktop
+	// equivalent of the touch data a phone would send, so it stays populated.
+	checkData.Set("accelerometer", "[]")
+	checkData.Set("gyroscope", "[]")
+	checkData.Set("motion", "[]")
+	checkData.Set("cursor", generateHumanCursor())
+	checkData.Set("taps", "[]")
+	checkData.Set("connectionRtt", connRtt)
+	checkData.Set("connectionDownlink", connDownlink)
+	checkData.Set("browser_fp", browserFp)
+	checkData.Set("hash", hash)
+	checkData.Set("answer", answer)
+	checkData.Set("debug_info", debugInfo)
 
 	checkResp, err := vkReq("captchaNotRobot.check", checkData)
 	if err != nil {
@@ -702,6 +753,9 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo stri
 	case "BOT":
 		turnLog("[STREAM %d] [Captcha] check returned BOT status", streamID)
 		return "", errCaptchaBot
+	case "ERROR_LIMIT":
+		turnLog("[STREAM %d] [Captcha] check returned ERROR_LIMIT — session throttled", streamID)
+		return "", errCaptchaRateLimit
 	default:
 		return "", fmt.Errorf("check status: %s", status)
 	}
@@ -710,10 +764,10 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo stri
 		return "", fmt.Errorf("success_token not found")
 	}
 
-	time.Sleep(time.Duration(180+rand.Intn(80)) * time.Millisecond)
+	time.Sleep(time.Duration(500+rand.Intn(300)) * time.Millisecond)
 
 	turnLog("[STREAM %d] [Captcha] Step 4/4: endSession", streamID)
-	if _, err := vkReq("captchaNotRobot.endSession", baseParams); err != nil {
+	if _, err := vkReq("captchaNotRobot.endSession", baseValues()); err != nil {
 		turnLog("[STREAM %d] [Captcha] Warning: endSession failed: %v", streamID, err)
 	}
 

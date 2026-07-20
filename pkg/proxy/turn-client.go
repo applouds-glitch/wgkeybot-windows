@@ -11,7 +11,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -31,35 +30,25 @@ func init() {
 	os.Setenv("GODEBUG", "netdns=go")
 }
 
-// clearTransientState resets DNS cache and HTTP connections without touching
-// credential caches. Called on every tunnel start so stale DNS/sockets are
-// flushed, but credentials earned in a prior session are reused if still valid.
+// clearTransientState resets the DNS cache without touching credential caches.
+// Called on every tunnel start so stale DNS is flushed, but credentials earned
+// in a prior session are reused if still valid. No HTTP pool is flushed here:
+// the VK cred fetch builds a per-fetch tlsclient and closes its idle
+// connections when done, and the DoH resolver does the same — there is no
+// long-lived shared client to reset.
 func clearTransientState() {
 	ClearCache()
-	turnHTTPClient.CloseIdleConnections()
-	turnLog("[PROXY] Transient state cleared (DNS + HTTP; creds preserved)")
+	turnLog("[PROXY] Transient state cleared (DNS; creds preserved)")
 }
 
 // NotifyNetworkChange — внешний API (вызывается Tunnel.OnPathChanged).
 // Credentials are preserved across a network change — VK tokens and TURN
-// username/password are not tied to the local IP, so only DNS and HTTP state is
+// username/password are not tied to the local IP, so only the DNS cache is
 // reset. The error-driven WorkerGroup re-fetches creds only if its streams
 // actually fail after the change, so a healthy session survives a network switch.
 func NotifyNetworkChange() {
 	ClearCache()
-	turnHTTPClient.CloseIdleConnections()
-	turnLog("[NETWORK] Network change: DNS cache + HTTP connections reset (creds preserved)")
-}
-
-var turnHTTPClient = &http.Client{
-	Timeout: 20 * time.Second,
-	Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:    100,
-		IdleConnTimeout: 90 * time.Second,
-	},
+	turnLog("[NETWORK] Network change: DNS cache reset (creds preserved)")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,9 +109,12 @@ const iPacketBuffMaxSize = 2048
 // Indication ticker + relay read-deadline + optional watchdog. The send interval
 // and dead-stream threshold adapt to app state (see globalIdleFlag):
 //
-//	active — foreground / screen on: fast keepalive, ~35s dead-stream detect.
-//	idle   — screen off / suspend: keepalive relaxes to the NAT-hold floor and
-//	         the detector widens to ~90s, cutting per-stream wakeups ~2.5×.
+//	active — foreground / screen on: keepalive every 10s (frequent echoes); dead 90s.
+//	idle   — screen off / suspend: keepalive relaxes to the NAT-hold floor (25s),
+//	         cutting per-stream wakeups ~2.5×; dead 90s.
+//
+// The dead-stream threshold is a uniform 90s (only the send interval adapts), so
+// a transient loss during a foreground lull can't false-teardown the streams.
 //
 // The NAT-hold floor (25s) is the hard ceiling: carrier CGNAT UDP mappings
 // commonly expire in 30-60s, so an idle keepalive must not exceed ~25-30s or the
@@ -132,9 +124,16 @@ const iPacketBuffMaxSize = 2048
 // accepts WriteTo, since SEND indications are fire-and-forget).
 const (
 	kaActiveInterval = 10 * time.Second
-	kaActiveDead     = 35 * time.Second
-	kaIdleInterval   = 25 * time.Second
-	kaIdleDead       = 90 * time.Second
+	// Dead-stream threshold is a uniform 90s in both modes — the same tolerance
+	// the old relay read-deadline had. A shorter active threshold (was 35s) tore
+	// healthy streams down during a normal foreground lull (no app traffic for
+	// ~35s): only echoes keep an idle stream's lastRx fresh, and a single
+	// transient loss of the coalesced echo burst starved every stream at once →
+	// mass reconnect on one credential → TURN 486 → captcha. Fast single-stream
+	// recovery was never user-visible (siblings carry the tunnel).
+	kaActiveDead   = 90 * time.Second
+	kaIdleInterval = 25 * time.Second
+	kaIdleDead     = 90 * time.Second
 )
 
 // keepaliveCadence returns the current keepalive send interval and dead-stream
@@ -146,13 +145,25 @@ func keepaliveCadence() (interval, dead time.Duration) {
 	return kaActiveInterval, kaActiveDead
 }
 
-// alignedSleep blocks until the next multiple of interval on a global wall-clock
-// grid (shared by every stream), then reports true; it reports false if ctx is
-// cancelled first. Because all streams align to the same grid with the same
-// interval, their keepalives fire in one coalesced burst — the NIC/radio wakes
-// once per interval instead of once per stream — with no cross-stream coordination.
-func alignedSleep(ctx context.Context, interval time.Duration) bool {
-	next := time.Now().Truncate(interval).Add(interval)
+// coalesceSpread is the width of the window over which the per-stream keepalive
+// bursts are spread (via alignedSleep's phase). Small vs the keepalive interval,
+// so the NIC still wakes in roughly one window per interval, but wide enough that
+// a brief packet loss does not miss every stream's echo at the same instant.
+const coalesceSpread = 2 * time.Second
+
+// alignedSleep blocks until the next `phase`-offset point on a global wall-clock
+// grid of period interval, then reports true; it reports false if ctx is
+// cancelled first. All streams share the grid, so their keepalives still cluster
+// into ~one wake window per interval (NIC wakes once, not once per stream), but
+// the per-stream phase staggers them by up to coalesceSpread so a transient loss
+// doesn't starve every stream's liveness echo simultaneously — which would tear
+// all streams down together → mass reconnect on one credential → TURN 486.
+func alignedSleep(ctx context.Context, interval, phase time.Duration) bool {
+	now := time.Now()
+	next := now.Truncate(interval).Add(phase)
+	if !next.After(now) {
+		next = next.Add(interval)
+	}
 	t := time.NewTimer(time.Until(next))
 	defer t.Stop()
 	select {
@@ -179,10 +190,13 @@ const freezeSlack = 20 * time.Second
 // a stale lastRx tears the stream down). Returns when ctx is cancelled or the
 // dead-stream detector fires.
 func (s *stream) runKeepalive(ctx context.Context, lastRx *atomic.Int64, reportErr func(error), send func(tick int) error) {
+	// Deterministic per-stream phase within the coalescing window, so sibling
+	// streams don't all fire (and expire) at the exact same instant.
+	phase := time.Duration(s.id%8) * (coalesceSpread / 8)
 	for tick := 0; ; tick++ {
 		interval, dead := keepaliveCadence()
 		before := time.Now()
-		if !alignedSleep(ctx, interval) {
+		if !alignedSleep(ctx, interval, phase) {
 			return
 		}
 		if slept := time.Since(before); slept > interval+freezeSlack {
@@ -914,7 +928,8 @@ type StartProxyParams struct {
 }
 
 // StartProxy запускает TURN-прокси. Возвращает 0 при первом готовом стриме,
-// -1 при ошибке/таймауте.
+// -1 при ошибке/таймауте, -2 при CALL_REQUIRES_AUTH, -4 при CALL_UNAVAILABLE
+// (звонок завершён/удалён или ссылка недействительна — ретраи бессмысленны).
 func StartProxy(p StartProxyParams) int32 {
 	clearTransientState()                  // flush DNS + HTTP without clearing credential caches
 	atomic.StoreInt32(&globalPauseFlag, 0) // reset on each new tunnel start
@@ -1027,6 +1042,8 @@ func StartProxy(p StartProxyParams) int32 {
 	turnLog("[PROXY] Pre-fetching credentials for %d group(s)...", len(links))
 	var prefetchWg sync.WaitGroup
 	var callRequiresAuth int32
+	var prefetchOk int32      // set to 1 if any group succeeds
+	var callUnavailable int32 // set to 1 if any group's call is dead/deleted/invalid link
 	for i, lk := range links {
 		prefetchWg.Add(1)
 		go func(groupID int, link string) {
@@ -1043,11 +1060,15 @@ func StartProxy(p StartProxyParams) int32 {
 					if strings.Contains(prefetchErr.Error(), "CALL_REQUIRES_AUTH") {
 						atomic.StoreInt32(&callRequiresAuth, 1)
 						turnLog("[PROXY] Pre-fetch group %d: CALL_REQUIRES_AUTH — aborting", groupID)
+					} else if strings.Contains(prefetchErr.Error(), "CALL_UNAVAILABLE") {
+						atomic.StoreInt32(&callUnavailable, 1)
+						turnLog("[PROXY] Pre-fetch group %d: CALL_UNAVAILABLE (call ended/deleted or invalid link)", groupID)
 					} else {
 						turnLog("[PROXY] Pre-fetch group %d failed: %v (WorkerGroup will retry)", groupID, prefetchErr)
 					}
 				}
 			} else {
+				atomic.StoreInt32(&prefetchOk, 1)
 				turnLog("[PROXY] Pre-fetch group %d OK", groupID)
 			}
 		}(i, lk)
@@ -1056,6 +1077,11 @@ func StartProxy(p StartProxyParams) int32 {
 	if atomic.LoadInt32(&callRequiresAuth) == 1 {
 		cancel()
 		return -2
+	}
+	if atomic.LoadInt32(&prefetchOk) == 0 && atomic.LoadInt32(&callUnavailable) == 1 {
+		turnLog("[PROXY] All pre-fetches failed: call unavailable (ended/deleted or invalid link) — aborting startup")
+		cancel()
+		return -4 // distinct code: dead call — no retry/captcha can recover it
 	}
 
 	// ── Launch groups ─────────────────────────────────────────────────────────

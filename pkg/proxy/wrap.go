@@ -47,8 +47,7 @@ var wrapCounter atomic.Uint64
 // packet plus up to wrapMaxPad random bytes overflows links whose path MTU sits
 // just below full size and gets silently dropped — large transfers stall while
 // small ones (chat) pass. Small packets keep their full 0..wrapMaxPad cover
-// jitter; only packets already near the ceiling lose padding. Windows-only
-// divergence (not present in Android/iOS wrap.go) — keep across syncs.
+// jitter; only packets already near the ceiling lose padding.
 var wrapMaxBody atomic.Int64
 
 func init() { wrapMaxBody.Store(wrapDefaultMaxBody) }
