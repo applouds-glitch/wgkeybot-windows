@@ -7,27 +7,21 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/pion/stun/v3"
 )
 
 const (
 	defaultCycleSecs = 36000 // cap for the credential cache TTL (see credentials.go)
 	workerStagger    = 500 * time.Millisecond
-
-	// preferredHeadStart is the grace window the preferred server (addrs[0])
-	// gets to win the Allocate race alone before runWithCreds fans out to the
-	// other servers. Long enough that a healthy preferred usually wins by itself
-	// on typical RTT (keeping steady-state at ~1 Allocate/stream), short enough
-	// that a dead preferred fails over quickly. Set to 400ms after Android field
-	// logs showed mobile-hotspot RTT spiking to ~315ms, which made a healthy
-	// preferred occasionally exceed a 300ms window and fan out unnecessarily.
-	preferredHeadStart = 400 * time.Millisecond
 )
 
 // vkSemaphore limits concurrent VK API credential fetches across all groups.
@@ -45,14 +39,13 @@ var allocSemaphore = make(chan struct{}, 3)
 
 // WorkerGroupConfig — parameters for one stream group (one VK link).
 type WorkerGroupConfig struct {
-	GroupID   int
-	Link      string
-	PeerAddr  *net.UDPAddr
-	UseUDP    bool
-	PeerType  string
-	TurnIP    string
-	TurnPort  int
-	PauseFlag *int32 // non-nil → check Doze-mode pause
+	GroupID  int
+	Link     string
+	PeerAddr *net.UDPAddr
+	UseUDP   bool
+	PeerType string
+	TurnIP   string
+	TurnPort int
 }
 
 // WorkerGroup runs the streams for one VK link using an error-driven, per-worker
@@ -92,14 +85,19 @@ func WorkerGroup(ctx context.Context, cfg WorkerGroupConfig, streams []*stream) 
 }
 
 // runWorker drives a single persistent stream: fetch creds → connect → on exit,
-// re-fetch creds (only for auth/quota errors) and reconnect. It returns only
-// when ctx is cancelled.
+// re-fetch creds (only for auth/quota errors) and reconnect. It returns when ctx
+// is cancelled, or when a credential failure is one that retrying cannot fix —
+// a dead call, or a captcha that lost the solve ladder maxCaptchaFailStreak
+// times in a row. Giving up is reported through reportWorkerGaveUp, which
+// escalates to a user-visible terminal failure once no worker is left.
 //
-// The TURN server is no longer chosen by index: runWithCreds races all servers
-// (preferred first, see orderPreferred) and the fastest to Allocate wins.
-// failStreak now only counts consecutive connect failures to drive the retry
-// backoff. A session that stayed up for a while (or was closed cleanly by the
-// server) resets the streak for a fast retry.
+// The TURN server is assigned statically, round-robin by stream ID (see
+// assignServers), so the streams are spread evenly across every server VK
+// returned. The other servers are failover only: runWithCreds dials them just
+// for this attempt, and only after the assigned one errors. failStreak only
+// counts consecutive connect failures to drive the retry backoff. A session
+// that stayed up for a while (or was closed cleanly by the server) resets the
+// streak for a fast retry.
 func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger time.Duration) {
 	if stagger > 0 {
 		select {
@@ -110,21 +108,14 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 	}
 
 	failStreak := 0
+	credFailStreak := 0 // consecutive credential fetches that failed for any reason
 	for {
-		if ctx.Err() != nil {
+		permit, ok := waitForNetworkPermit(ctx, true)
+		if !ok {
 			return
 		}
-
-		// Doze-mode pause: suspend reconnects while the device is dozing.
-		if cfg.PauseFlag != nil && atomic.LoadInt32(cfg.PauseFlag) != 0 {
-			turnLog("[WORKER %d] Paused (Doze)", s.id)
-			for atomic.LoadInt32(cfg.PauseFlag) != 0 {
-				if ctx.Err() != nil {
-					return
-				}
-				time.Sleep(1 * time.Second)
-			}
-			turnLog("[WORKER %d] Resumed", s.id)
+		if permit.unvalidatedProbe {
+			turnLog("[WORKER %d] Controlled probe on unvalidated network", s.id)
 		}
 
 		// Fetch credentials via the shared cache. A cache hit is cheap (no VK
@@ -133,48 +124,104 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		select {
 		case vkSemaphore <- struct{}{}:
 		case <-ctx.Done():
+			releaseNetworkPermit(permit)
 			return
 		}
 		user, pass, addrs, err := fetchCreds(ctx, cfg.Link, cfg.GroupID)
 		<-vkSemaphore
 		if err != nil {
+			releaseNetworkPermit(permit)
 			if ctx.Err() != nil {
 				return
 			}
-			turnLog("[WORKER %d] Credential error: %v — retry in 30s", s.id, err)
+			if !permit.unvalidatedProbe && !isNetworkAvailable() {
+				// Offline: not evidence about the credential, and the gate above
+				// already parks the retry. Don't let it age the streaks.
+				continue
+			}
+
+			// A dead call or one that needs a logged-in account cannot be fixed by
+			// any number of retries — the startup path already treats both as
+			// terminal. Mid-session they used to fall into the same endless 30s
+			// loop as a lost packet.
+			if isTerminalCredError(err) {
+				reportWorkerGaveUp(s.id, err.Error())
+				return
+			}
+
+			credFailStreak++
+			var wait time.Duration
+			switch {
+			case errors.Is(err, errCaptchaUnsolved), errors.Is(err, errCaptchaLockout):
+				// Either this worker just lost the solve ladder, or another one did
+				// and the global lockout is still armed. Both mean the same thing:
+				// the captcha gate is not opening. Give up once the session has spent
+				// its budget of ladders — including the windows they put in front of
+				// the user — rather than reopening it for as long as the tunnel is up.
+				if captchaFailureStreak() >= maxCaptchaFailStreak {
+					reportWorkerGaveUp(s.id, "captcha unsolved")
+					return
+				}
+				// The lockout window (exponential, see bumpCaptchaLockout) is the real
+				// pacing here: nothing can succeed before it expires, so sleep it out
+				// instead of retrying on a cadence it would only reject again.
+				wait = captchaLockoutRemaining() + time.Duration(rand.Intn(5000))*time.Millisecond
+				if wait < 5*time.Second {
+					wait = 5 * time.Second
+				}
+			default:
+				// Everything else (VK rate limit, HTTP failure, a transient 5xx) is
+				// assumed recoverable, so the worker keeps retrying — but on a
+				// backoff, not a fixed 30s forever.
+				wait = credRetryDelay(credFailStreak)
+			}
+
+			turnLog("[WORKER %d] Credential error (streak %d, captcha %d/%d): %v — retry in %v",
+				s.id, credFailStreak, captchaFailureStreak(), maxCaptchaFailStreak, err, wait.Round(time.Second))
 			select {
-			case <-time.After(30 * time.Second):
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return
 			}
+			continue
+		}
+		credFailStreak = 0
+
+		// Effective availability can disappear while credentials are being fetched.
+		// Re-check before Allocate unless this worker owns the single controlled
+		// probe permit. Healthy sessions never pass through this gate.
+		if !permit.unvalidatedProbe && !isNetworkAvailable() {
+			releaseNetworkPermit(permit)
 			continue
 		}
 
 		// Apply optional manual TurnIP/TurnPort override to the fetched list.
 		addrs = applyTurnOverride(addrs, cfg)
 
-		// Put the last race winner (if any) first so it gets the head-start in
-		// the Allocate race; runWithCreds still races the rest if it has died.
-		addrs = orderPreferred(addrs, cfg.GroupID)
-
-		// The first connection in a group (no winner elected yet) probes all
-		// servers at once to pick the fastest; everyone else follows that
-		// election and only head-start-races (preferred first, fan out on
-		// failure) — so A-vs-B is tested once per group, not on every stream.
-		raceAll := !hasPreferred(cfg.GroupID)
+		// Where this stream runs: the session's elected server once one is
+		// chosen, otherwise round-robin by stream ID. The rest of the list
+		// follows only as failover for this attempt.
+		addrs = assignServers(addrs, s.id)
+		attemptHead := addrs[0]
 
 		start := time.Now()
-		runErr := s.runWithCreds(ctx, user, pass, addrs, cfg, raceAll)
+		runErr := s.runWithCreds(ctx, user, pass, addrs, cfg)
 		sessionDur := time.Since(start)
+		releaseNetworkPermit(permit)
 
 		if ctx.Err() != nil {
 			return
 		}
+		if !isNetworkAvailable() {
+			// Skip per-worker retry delays while offline. The gate above resumes on
+			// the host's signal, fresh TURN proof, or one rate-limited probe permit.
+			continue
+		}
 
 		if runErr == nil {
 			// runWithCreds returned nil while the tunnel is still up: the TURN
-			// server closed this stream. Reconnect just this worker (racing the
-			// servers afresh) after a brief delay, with the backoff reset (avoids
+			// server closed this stream. Reconnect just this worker (back to its
+			// assigned server) after a brief delay, with the backoff reset (avoids
 			// a hot loop if the server keeps closing immediately).
 			turnLog("[WORKER %d] Stream closed by server → reconnecting", s.id)
 			failStreak = 0
@@ -199,13 +246,35 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		// A session that stayed up for a while was healthy; treat its drop as a
 		// fresh failure (reset the backoff) rather than as part of a failure
 		// streak.
-		if sessionDur > 60*time.Second {
+		if sessionDur >= healthySessionDuration {
 			failStreak = 0
 		} else {
 			failStreak++
 		}
 
+		// A failure on a server the next attempt will not even dial is not a
+		// repeat of the same failure: the election (or a stand-down) has just
+		// moved this stream to a different host, and that host deserves a first
+		// attempt, not the backoff the dead one earned. Without this a stream
+		// that failed twice on a dead relay waited 7-17s before trying the
+		// working one — most of the connect budget, spent sleeping next to a
+		// server that was already known to work.
+		if assignServers(addrs, s.id)[0] != attemptHead {
+			failStreak = 0
+		}
+
 		retryDelay := reconnectDelay(failStreak)
+		// 486 (TURN allocation quota) after a mass teardown — say a host freeze
+		// past the relay idle timeout, where the kernel closed our sockets but the
+		// server-side allocations survive as zombies still holding the credential's
+		// quota — is a special case: a fast retry just hits 486 again before the
+		// single-flight refreshGroupCreds can land a fresh credential with a fresh
+		// quota. Replace the 0.5-1s retry with a long jittered cooldown: (a) give
+		// the refetch time to arrive, (b) spread the N workers that failed at the
+		// same instant so they don't hammer the server in lockstep.
+		if isQuotaError(runErr) {
+			retryDelay = quotaCooldown()
+		}
 		turnLog("[WORKER %d] Error (streak %d): %v → retry in %v", s.id, failStreak, runErr, retryDelay)
 		select {
 		case <-time.After(retryDelay):
@@ -213,6 +282,43 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 			return
 		}
 	}
+}
+
+const (
+	// maxCaptchaFailStreak is how many captcha solve ladders — each of which can
+	// end in a visible WebView2 window — the session runs back to back before the
+	// workers accept that the gate is not opening and stop. Counted session-wide
+	// (see captchaFailureStreak); each failure also widens the global lockout, so
+	// the five attempts stretch over ~15 minutes instead of hammering the user.
+	// vkSemaphore still admits two concurrent VK fetches, but the 3-6s gap in
+	// fetchVkCreds spaces the token chains themselves, so two workers no longer
+	// run a full ladder each in the same round.
+	maxCaptchaFailStreak = 5
+	// credRetryBase is the first backoff after a failed credential fetch, and
+	// credRetryMax caps the exponential growth.
+	credRetryBase = 30 * time.Second
+	credRetryMax  = 5 * time.Minute
+)
+
+// credRetryDelay returns the jittered backoff before retrying a credential fetch
+// that failed for a recoverable reason: 30s, 1m, 2m, 4m, then 5m. A flat 30s
+// forever kept a permanently broken group hitting VK 120 times an hour.
+func credRetryDelay(streak int) time.Duration {
+	if streak < 1 {
+		streak = 1
+	}
+	d := credRetryBase << uint(min(streak-1, 4))
+	if d > credRetryMax {
+		d = credRetryMax
+	}
+	return d + time.Duration(rand.Intn(5000))*time.Millisecond
+}
+
+// isTerminalCredError reports whether a credential failure is one that no retry
+// can fix: the VK call has ended or the join link is invalid (CALL_UNAVAILABLE),
+// or the call refuses anonymous joins (CALL_REQUIRES_AUTH).
+func isTerminalCredError(err error) bool {
+	return isCallUnavailable(err) || errors.Is(err, errCallRequiresAuth)
 }
 
 // reconnectDelay returns the backoff before a worker's next connect attempt.
@@ -235,21 +341,97 @@ func reconnectDelay(failStreak int) time.Duration {
 	return base + time.Duration(5+rand.Intn(11))*time.Second
 }
 
+// isQuotaError reports whether err is specifically a TURN allocation-quota
+// rejection (486). Narrower than classifyCredError: only the quota case warrants
+// the long quotaCooldown, because the cred IS valid — its allocation slots are
+// just full (usually with our own zombie allocations after a mass teardown).
+func isQuotaError(err error) bool {
+	if code, ok := turnErrorCode(err); ok {
+		return code == stun.CodeAllocQuotaReached
+	}
+	if isTransportError(err) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "quota")
+}
+
+// turnErrorCode extracts the numeric STUN/TURN error code when err carries a
+// server error response (pion builds a *stun.TurnError in sendAllocateRequest,
+// client.go:441). ok=false for every other error — dial/write failures,
+// watchdog, context cancellation.
+func turnErrorCode(err error) (stun.ErrorCode, bool) {
+	var turnErr *stun.TurnError
+	if errors.As(err, &turnErr) {
+		return turnErr.ErrorCodeAttr.Code, true
+	}
+	return 0, false
+}
+
+// isTransportError reports whether err is a socket/network-level failure (dial
+// refused, EHOSTUNREACH, EPIPE, timeout). Such errors say nothing about the
+// credential — and critically, their text carries IPs and ephemeral ports, so
+// they must never reach the substring fallbacks below. Field case: an Allocate
+// from local port 50819 produced "write udp 10.69.196.227:50819->…: broken
+// pipe", whose "508" matched the Insufficient-Capacity pattern and force-expired
+// a healthy credential mid-outage.
+func isTransportError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var syscallErr syscall.Errno
+	return errors.As(err, &syscallErr)
+}
+
+// quotaCooldown is the jittered backoff after a 486. 5-13s gives the single-flight
+// refreshGroupCreds time to land a fresh credential (new quota) and spreads the
+// N simultaneously-saturated workers so they don't retry in lockstep and re-hit 486.
+func quotaCooldown() time.Duration {
+	return 5*time.Second + time.Duration(rand.Intn(8001))*time.Millisecond
+}
+
 // classifyCredError reports whether err from a TURN session indicates the
 // credential should be re-fetched: TURN allocation quota (486) or stale/invalid
 // credentials (401/stale nonce/etc.). Other errors (dial failures, watchdog,
 // transient drops) are handled by a plain reconnect that keeps the credential.
+//
+// Classification is code-driven where possible: pion surfaces a server error
+// response as *stun.TurnError, so the numeric code is authoritative. Bare
+// substring matching on the message is the fallback for errors that never carry
+// a code (our own wrappers, non-pion paths) — and it runs only after transport
+// errors are excluded, because their addresses/ports collide with the numeric
+// patterns (see isTransportError). The surviving numeric patterns are anchored
+// on "error " for the same reason.
 func classifyCredError(err error) bool {
+	if code, ok := turnErrorCode(err); ok {
+		switch code {
+		case stun.CodeUnauthorized, // 401
+			stun.CodeStaleNonce,           // 438
+			stun.CodeAllocMismatch,        // 437
+			stun.CodeWrongCredentials,     // 441
+			stun.CodeAllocQuotaReached,    // 486
+			stun.CodeInsufficientCapacity: // 508
+			return true
+		}
+		return false
+	}
+	if isTransportError(err) {
+		return false
+	}
 	e := strings.ToLower(err.Error())
 	return strings.Contains(e, "quota") ||
-		strings.Contains(e, "486") ||
+		strings.Contains(e, "error 486") ||
 		strings.Contains(e, "allocation quota reached") ||
-		strings.Contains(e, "401") ||
+		strings.Contains(e, "error 401") ||
 		strings.Contains(e, "unauthorized") ||
 		strings.Contains(e, "stale nonce") ||
 		strings.Contains(e, "allocation mismatch") ||
 		strings.Contains(e, "attribute not found") ||
-		strings.Contains(e, "508") ||
+		strings.Contains(e, "error 508") ||
 		strings.Contains(e, "error 29")
 }
 

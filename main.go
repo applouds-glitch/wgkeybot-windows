@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 
 	"github.com/getlantern/systray"
@@ -13,14 +14,16 @@ import (
 func main() {
 	// Prevent multiple instances via named mutex.
 	name, _ := windows.UTF16PtrFromString("WgKeyBot_SingleInstance")
-	handle, _ := windows.CreateMutex(nil, false, name)
+	handle, err := windows.CreateMutex(nil, false, name)
 	if handle == 0 {
 		os.Exit(1)
 	}
 	defer windows.CloseHandle(handle)
 
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		showAlreadyRunning()
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if !tray.FocusWindow() {
+			showAlreadyRunning()
+		}
 		os.Exit(0)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,14 +32,25 @@ type App struct {
 
 	settings winbridge.AppSettings
 
-	connectedAt  time.Time
-	statsRunning bool
+	connectedAt      time.Time
+	stats            winbridge.TunnelStats
+	savedConfig      *winbridge.TunnelConfig
+	configError      string
+	activeConfigHash string
+	dashboard        atomic.Uintptr
+	exiting          atomic.Bool
+	actions          chan func()
+	disconnecting    bool
+	blinkMu          sync.Mutex
+
+	mOpen *systray.MenuItem
 
 	mConnect    *systray.MenuItem
 	mDisconnect *systray.MenuItem
 	mImport     *systray.MenuItem
 	mUpdate     *systray.MenuItem
 	mAutoConn   *systray.MenuItem
+	mAutoRefr   *systray.MenuItem
 	mModeVPN    *systray.MenuItem
 	mModeSOCKS  *systray.MenuItem
 	mLog        *systray.MenuItem // nil when not in debug mode
@@ -48,7 +60,22 @@ type App struct {
 	stopBlink      func() // stops connecting blink animation, nil when not blinking
 	solvingCaptcha atomic.Bool
 	connecting     bool // true while doConnect is in progress, prevents double-connect
+
+	// refreshing — идёт запрос конфига (ручной или фоновый); второй параллельный
+	// не запускается. nextAutoRefresh — unix-время, раньше которого фоновое
+	// обновление не пробует снова: после неудачи, чтобы не долбить control plane
+	// каждые 5 секунд опроса статуса.
+	refreshing      atomic.Bool
+	nextAutoRefresh atomic.Int64
 }
+
+const (
+	// autoRefreshInterval — как часто фоновое обновление ходит за конфигом.
+	// Как на Android: раз в 12 часов, только через поднятый туннель.
+	autoRefreshInterval = 12 * time.Hour
+	// autoRefreshRetry — пауза после неудачной фоновой попытки.
+	autoRefreshRetry = 30 * time.Minute
+)
 
 // New creates the tray App. Pass debug=true to enable log file and log menu item.
 func New(debug bool) *App {
@@ -56,6 +83,7 @@ func New(debug bool) *App {
 	return &App{
 		debug:    debug,
 		settings: winbridge.LoadSettings(),
+		actions:  make(chan func(), 32),
 	}
 }
 
@@ -68,7 +96,9 @@ func (a *App) OnReady() {
 	systray.SetIcon(assets.IconDisconnected())
 	systray.SetTooltip("Отключено")
 
-	a.mConnect = systray.AddMenuItem("Подключить...", "Выбрать .conf и подключиться")
+	a.mOpen = systray.AddMenuItem("Открыть WgKeyBot", "Состояние, конфиг и трафик")
+	systray.AddSeparator()
+	a.mConnect = systray.AddMenuItem("Подключить", "Подключиться с сохранённым конфигом")
 	a.mDisconnect = systray.AddMenuItem("Отключить", "Остановить VPN туннель")
 	a.mDisconnect.Disable()
 	systray.AddSeparator()
@@ -77,6 +107,10 @@ func (a *App) OnReady() {
 	a.mAutoConn = systray.AddMenuItem("Подключаться при запуске", "Автоматически поднимать VPN при старте")
 	if a.settings.AutoConnect {
 		a.mAutoConn.Check()
+	}
+	a.mAutoRefr = systray.AddMenuItem("Обновлять конфиг автоматически", "Раз в 12 часов проверять конфиг через поднятый туннель")
+	if !a.settings.AutoRefreshDisabled {
+		a.mAutoRefr.Check()
 	}
 	systray.AddSeparator()
 	mMode := systray.AddMenuItem("Режим", "Выбор режима работы")
@@ -95,15 +129,22 @@ func (a *App) OnReady() {
 	systray.AddSeparator()
 	a.mQuit = systray.AddMenuItem("Выход", "Закрыть WgKeyBot")
 
+	a.loadConfigInfo()
+	go a.runDashboard()
 	go a.eventLoop()
 
-	if a.settings.AutoConnect {
+	if a.settingsSnapshot().AutoConnect {
 		go a.doAutoConnect()
 	}
 }
 
 // OnExit is called by systray on exit — clean up the tunnel.
 func (a *App) OnExit() {
+	a.exiting.Store(true)
+	if hwnd := a.dashboard.Load(); hwnd != 0 {
+		pPostMessage.Call(hwnd, wmDispose, 0, 0)
+	}
+	a.cancelBlink()
 	a.mu.Lock()
 	mgr := a.manager
 	cancel := a.cancel
@@ -125,6 +166,12 @@ func (a *App) eventLoop() {
 
 	for {
 		select {
+		case action := <-a.actions:
+			action()
+		case <-a.mOpen.ClickedCh:
+			if hwnd := a.dashboard.Load(); hwnd != 0 {
+				pPostMessage.Call(hwnd, wmShowDashboard, 0, 0)
+			}
 		case <-a.mConnect.ClickedCh:
 			go a.doConnect()
 		case <-a.mDisconnect.ClickedCh:
@@ -135,6 +182,8 @@ func (a *App) eventLoop() {
 			go a.doUpdate()
 		case <-a.mAutoConn.ClickedCh:
 			a.doAutoConnectToggle()
+		case <-a.mAutoRefr.ClickedCh:
+			a.doAutoRefreshToggle()
 		case <-a.mModeVPN.ClickedCh:
 			a.doSetMode(winbridge.ModeVPN)
 		case <-a.mModeSOCKS.ClickedCh:
@@ -154,38 +203,53 @@ func (a *App) eventLoop() {
 // ── Actions ────────────────────────────────────────────────────────────────────
 
 func (a *App) doAutoConnectToggle() {
-	if a.mAutoConn.Checked() {
-		a.mAutoConn.Uncheck()
-		a.settings.AutoConnect = false
-	} else {
-		a.mAutoConn.Check()
-		a.settings.AutoConnect = true
-	}
+	a.mu.Lock()
+	a.settings.AutoConnect = !a.settings.AutoConnect
 	winbridge.SaveSettings(a.settings)
+	enabled := a.settings.AutoConnect
+	a.mu.Unlock()
+	if enabled {
+		a.mAutoConn.Check()
+	} else {
+		a.mAutoConn.Uncheck()
+	}
 }
 
-// doSetMode переключает режим работы (vpn / socks). Запрещено при активном
-// туннеле — сначала нужно отключиться.
+func (a *App) doAutoRefreshToggle() {
+	a.mu.Lock()
+	a.settings.AutoRefreshDisabled = !a.settings.AutoRefreshDisabled
+	winbridge.SaveSettings(a.settings)
+	disabled := a.settings.AutoRefreshDisabled
+	a.mu.Unlock()
+	if disabled {
+		a.mAutoRefr.Uncheck()
+	} else {
+		a.mAutoRefr.Check()
+	}
+}
+
 func (a *App) doSetMode(mode winbridge.Mode) {
 	a.mu.Lock()
-	busy := a.manager != nil || a.connecting
-	a.mu.Unlock()
-
-	if busy {
-		// Восстанавливаем отметки — клик не должен менять состояние «на лету».
-		a.refreshModeChecks()
-		go ShowInfo("Смена режима", "Сначала отключитесь, затем выберите режим.")
-		return
+	busy := a.manager != nil || a.connecting || a.disconnecting
+	if !busy {
+		a.settings.Mode = mode
+		winbridge.SaveSettings(a.settings)
 	}
-
-	a.settings.Mode = mode
-	winbridge.SaveSettings(a.settings)
+	a.mu.Unlock()
 	a.refreshModeChecks()
+	if busy {
+		go ShowInfo("Смена режима", "Сначала отключитесь, затем выберите режим.")
+	}
 }
 
-// refreshModeChecks выставляет галочки подменю в соответствии с a.settings.Mode.
+func (a *App) settingsSnapshot() winbridge.AppSettings {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.settings
+}
+
 func (a *App) refreshModeChecks() {
-	if a.settings.Mode == winbridge.ModeSOCKS {
+	if a.settingsSnapshot().Mode == winbridge.ModeSOCKS {
 		a.mModeSOCKS.Check()
 		a.mModeVPN.Uncheck()
 	} else {
@@ -194,61 +258,13 @@ func (a *App) refreshModeChecks() {
 	}
 }
 
-func (a *App) doAutoConnect() {
+func (a *App) doAutoConnect() { a.connect(true) }
+
+func (a *App) doConnect() { a.connect(false) }
+
+func (a *App) connect(automatic bool) {
 	a.mu.Lock()
-	if a.manager != nil || a.connecting {
-		a.mu.Unlock()
-		return
-	}
-	a.connecting = true
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.connecting = false
-		a.mu.Unlock()
-	}()
-
-	confPath, err := a.resolveConfig()
-	if err != nil {
-		return
-	}
-
-	cfg, err := winbridge.ParseEncryptedConfig(confPath)
-	if err != nil {
-		return
-	}
-
-	mgr := winbridge.NewManager(cfg)
-	mgr.SetMode(a.settings.Mode, a.settings.SocksPort)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	a.mu.Lock()
-	a.manager = mgr
-	a.cfg = cfg
-	a.cancel = cancel
-	a.mu.Unlock()
-
-	a.setConnecting()
-
-	if err := mgr.Connect(ctx); err != nil {
-		log.Printf("[Tray] auto-connect error: %v", err)
-		a.mu.Lock()
-		a.manager = nil
-		a.cancel = nil
-		a.mu.Unlock()
-		cancel()
-		a.setDisconnected()
-		return
-	}
-
-	a.setConnected()
-	go a.watchStatus(ctx)
-	mgr.StartWatchdog(ctx, func() { go a.doWatchdogReconnect() })
-}
-
-func (a *App) doConnect() {
-	a.mu.Lock()
-	if a.manager != nil || a.connecting {
+	if a.manager != nil || a.connecting || a.disconnecting || a.exiting.Load() {
 		a.mu.Unlock()
 		return
 	}
@@ -263,7 +279,9 @@ func (a *App) doConnect() {
 	confPath, err := a.resolveConfig()
 	if err != nil {
 		log.Printf("[Tray] config resolve error: %v", err)
-		go ShowError("Ошибка выбора конфига", err.Error())
+		if !automatic {
+			go ShowError("Ошибка выбора конфига", err.Error())
+		}
 		return
 	}
 	if confPath == "" {
@@ -272,17 +290,26 @@ func (a *App) doConnect() {
 
 	cfg, err := winbridge.ParseEncryptedConfig(confPath)
 	if err != nil {
-		go ShowError("Ошибка конфига", err.Error())
+		if !automatic {
+			go ShowError("Ошибка конфига", err.Error())
+		}
 		return
 	}
 
 	mgr := winbridge.NewManager(cfg)
-	mgr.SetMode(a.settings.Mode, a.settings.SocksPort)
+	settings := a.settingsSnapshot()
+	mgr.SetMode(settings.Mode, settings.SocksPort)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a.mu.Lock()
+	if a.exiting.Load() {
+		a.mu.Unlock()
+		cancel()
+		return
+	}
 	a.manager = mgr
 	a.cfg = cfg
+	a.activeConfigHash = a.settings.LastConfigHash
 	a.cancel = cancel
 	a.mu.Unlock()
 
@@ -296,15 +323,19 @@ func (a *App) doConnect() {
 		a.mu.Unlock()
 		cancel()
 		a.setDisconnected()
-		if !errors.Is(err, context.Canceled) {
+		if !automatic && !errors.Is(err, context.Canceled) {
 			go ShowError("Ошибка подключения", err.Error())
 		}
 		return
 	}
 
-	a.setConnected()
-	go a.watchStatus(ctx)
-	mgr.StartWatchdog(ctx, func() { go a.doWatchdogReconnect() })
+	if !a.setConnected(mgr) {
+		return
+	}
+	go a.watchStatus(ctx, mgr)
+	mgr.StartWatchdog(ctx,
+		func() { go a.doWatchdogReconnect() },
+		func(reason string) { go a.doTurnFatal(mgr, reason) })
 }
 
 // doWatchdogReconnect вызывается watchdog'ом когда WG handshake умер.
@@ -314,7 +345,7 @@ func (a *App) doWatchdogReconnect() {
 	cfg := a.cfg
 	mode := a.settings.Mode
 	socksPort := a.settings.SocksPort
-	if a.connecting || cfg == nil {
+	if a.connecting || a.disconnecting || a.manager == nil || cfg == nil || a.exiting.Load() {
 		a.mu.Unlock()
 		return
 	}
@@ -376,9 +407,55 @@ func (a *App) doWatchdogReconnect() {
 		return
 	}
 
-	a.setConnected()
-	go a.watchStatus(ctx)
-	mgr.StartWatchdog(ctx, func() { go a.doWatchdogReconnect() })
+	if !a.setConnected(mgr) {
+		return
+	}
+	go a.watchStatus(ctx, mgr)
+	mgr.StartWatchdog(ctx,
+		func() { go a.doWatchdogReconnect() },
+		func(reason string) { go a.doTurnFatal(mgr, reason) })
+}
+
+// doTurnFatal вызывается, когда TURN-прокси сообщил, что все воркеры сдались:
+// капча не решается, либо звонок умер уже после подключения. Реконнект здесь
+// бессмысленен — он уедет в ту же стену, — поэтому просто отключаемся и
+// показываем причину.
+//
+// mgr — тот Manager, чей watchdog вызвал этот колбэк (захвачен в замыкании на
+// месте вызова StartWatchdog). Между стартом watchdog-горутины и её срабатыванием
+// пользователь (или сам watchdog другим путём — doWatchdogReconnect) мог успеть
+// создать новый Manager; в этом случае a.manager уже не mgr, и разрывать текущее
+// (другое, возможно рабочее) соединение по устаревшему сигналу нельзя — no-op.
+func (a *App) doTurnFatal(mgr *winbridge.Manager, reason string) {
+	a.mu.Lock()
+	current := a.manager
+	a.mu.Unlock()
+	if current != mgr {
+		log.Printf("[Tray] TURN fatal from a stale manager, ignoring: %s", reason)
+		return
+	}
+
+	log.Printf("[Tray] TURN fatal: %s", reason)
+	go Notify("VPN", "Соединение остановлено: "+turnFatalMessage(reason), niifError)
+	a.doDisconnect()
+}
+
+// turnFatalMessage переводит причину из turnFatalReason() (сырой err.Error()
+// из pkg/proxy, часто на английском) в русский текст для баллуна — теми же
+// формулировками, что Connect использует для тех же состояний
+// (ReadyStatusAuthRequired/ReadyStatusCallUnavailable, winbridge/tunnel.go),
+// чтобы пользователь не видел два разных объяснения одной и той же причины
+// в зависимости от того, оборвалось соединение при подключении или посреди
+// сессии.
+func turnFatalMessage(reason string) string {
+	switch {
+	case strings.Contains(reason, "CALL_REQUIRES_AUTH"):
+		return "VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»"
+	case strings.Contains(reason, "CALL_UNAVAILABLE"):
+		return "VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг"
+	default:
+		return "не удалось восстановить соединение — попробуйте переподключиться позже или обновите конфиг"
+	}
 }
 
 func (a *App) doDisconnect() {
@@ -392,24 +469,37 @@ func (a *App) doDisconnect() {
 // reconnect), чтобы doDisconnect мог перейти в disconnected-состояние.
 func (a *App) teardown() bool {
 	a.mu.Lock()
-	mgr := a.manager
-	cancel := a.cancel
-	a.manager = nil
-	a.cancel = nil
+	if a.disconnecting {
+		a.mu.Unlock()
+		return false
+	}
+	mgr, cancel := a.manager, a.cancel
+	a.manager, a.cancel = nil, nil
+	a.disconnecting = true
 	a.mu.Unlock()
-
-	hadActivity := cancel != nil
+	defer func() { a.mu.Lock(); a.disconnecting = false; a.mu.Unlock() }()
 	if cancel != nil {
 		cancel()
 	}
 	if mgr != nil {
+		// Retain final counters after disconnection; the next connect resets them.
+		st := mgr.Stats()
 		mgr.Disconnect()
-		hadActivity = true
+		a.mu.Lock()
+		if st.Connected {
+			a.stats = st
+		}
+		a.stats.Connected = false
+		a.mu.Unlock()
 	}
-	return hadActivity
+	return cancel != nil || mgr != nil
 }
 
 func (a *App) doImport() {
+	if !a.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.refreshing.Store(false)
 	token, err := InputDialog("WgKeyBot Импорт", "Введите токен WgKeyBot:")
 	if err != nil {
 		log.Printf("[Tray] input dialog error: %v", err)
@@ -435,22 +525,47 @@ func (a *App) doImport() {
 		return
 	}
 
+	a.mu.Lock()
 	a.settings.AccessToken = accessToken
+	a.settings.LastConfigHash = winbridge.ConfigHash(data)
+	a.settings.LastRefresh = time.Now()
 	winbridge.SaveSettings(a.settings)
+	a.mu.Unlock()
+	a.loadConfigInfo()
 
 	go Notify("Импорт", "Настройки подключения получены", niifInfo)
 }
 
-// doUpdate перезагружает конфиг по сохранённому access_token.
-func (a *App) doUpdate() {
-	if a.settings.AccessToken == "" {
-		go ShowError("Обновление конфига",
-			"Сессия не найдена.\nСначала выполните «Импорт токена...».")
+// doUpdate — пункт меню «Обновить конфиг».
+func (a *App) doUpdate() { a.refreshConfig(true) }
+
+// refreshConfig запрашивает конфиг у control plane по сохранённому
+// access_token. Ручной вызов (manual) применяет его сразу — с переподключением,
+// если туннель поднят, — и отчитывается пользователю. Фоновый только
+// сохраняет: живой туннель он не трогает, новый конфиг вступит в силу при
+// следующем подключении. В обоих случаях конфиг, совпавший по SHA-256 с
+// последним сохранённым, не пересохраняется и не переподключает — раньше
+// ручное обновление рвало туннель даже ради того же самого конфига.
+func (a *App) refreshConfig(manual bool) {
+	if !a.refreshing.CompareAndSwap(false, true) {
 		return
 	}
-
-	data, err := winbridge.FetchConfig(a.settings.AccessToken)
+	defer a.refreshing.Store(false)
+	settings := a.settingsSnapshot()
+	if settings.AccessToken == "" {
+		if manual {
+			go ShowError("Обновление конфига",
+				"Сессия не найдена.\nСначала выполните «Импорт токена...».")
+		}
+		return
+	}
+	data, err := winbridge.FetchConfig(settings.AccessToken)
 	if err != nil {
+		if !manual {
+			log.Printf("[Tray] auto-refresh: fetch failed: %v", err)
+			a.nextAutoRefresh.Store(time.Now().Add(autoRefreshRetry).Unix())
+			return
+		}
 		if errors.Is(err, winbridge.ErrUnauthorized) {
 			go ShowError("Обновление конфига", winbridge.ErrUnauthorized.Error())
 		} else {
@@ -464,8 +579,37 @@ func (a *App) doUpdate() {
 		return
 	}
 
+	hash := winbridge.ConfigHash(data)
+	if hash == settings.LastConfigHash {
+		a.mu.Lock()
+		a.settings.LastRefresh = time.Now()
+		winbridge.SaveSettings(a.settings)
+		a.mu.Unlock()
+		if manual {
+			go Notify("Обновление", "Конфиг актуален", niifInfo)
+		} else {
+			log.Printf("[Tray] auto-refresh: config unchanged")
+		}
+		return
+	}
+
 	if _, err := winbridge.SaveConfig(data); err != nil {
-		go ShowError("Ошибка сохранения", err.Error())
+		if manual {
+			go ShowError("Ошибка сохранения", err.Error())
+		} else {
+			log.Printf("[Tray] auto-refresh: save failed: %v", err)
+		}
+		return
+	}
+	a.mu.Lock()
+	a.settings.LastConfigHash = hash
+	a.settings.LastRefresh = time.Now()
+	winbridge.SaveSettings(a.settings)
+	a.mu.Unlock()
+	a.loadConfigInfo()
+
+	if !manual {
+		log.Printf("[Tray] auto-refresh: new config saved, applies on next connect")
 		return
 	}
 
@@ -484,34 +628,65 @@ func (a *App) doUpdate() {
 	go Notify("Обновление", "Конфиг обновлён", niifInfo)
 }
 
+// maybeAutoRefresh запускает фоновое обновление конфига, когда с последнего
+// прошло autoRefreshInterval. Только через поднятый туннель — есть рукопожатие:
+// control plane снаружи туннеля может быть заблокирован, а без рукопожатия
+// запрос ушёл бы в ещё не работающий туннель и отвалился бы по таймауту.
+// Вызывается из цикла опроса статуса, то есть только пока туннель поднят.
+func (a *App) maybeAutoRefresh(st winbridge.TunnelStats) {
+	settings := a.settingsSnapshot()
+	if settings.AutoRefreshDisabled || settings.AccessToken == "" || st.LastHandshake.IsZero() {
+		return
+	}
+	now := time.Now()
+	if now.Sub(settings.LastRefresh) < autoRefreshInterval || now.Unix() < a.nextAutoRefresh.Load() {
+		return
+	}
+	// Ставится до запуска: пока запрос идёт, следующий тик не должен завести
+	// второй, а после успеха отсчёт ведётся уже от LastRefresh.
+	a.nextAutoRefresh.Store(now.Add(autoRefreshRetry).Unix())
+	go a.refreshConfig(false)
+}
+
 // ── Status monitoring ──────────────────────────────────────────────────────────
 
-func (a *App) watchStatus(ctx context.Context) {
-	a.mu.Lock()
-	a.statsRunning = true
-	a.mu.Unlock()
-
-	ticker := time.NewTicker(5 * time.Second)
+// Each watcher belongs to one manager and exits on cancellation. The UI reads
+// only the cached snapshot, so a slow UAPI/network operation cannot freeze it.
+func (a *App) watchStatus(ctx context.Context, mgr *winbridge.Manager) {
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		a.mu.Lock()
-		mgr := a.manager
-		connAt := a.connectedAt
-		a.mu.Unlock()
-		if mgr == nil {
+	networkTick := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if ctx.Err() != nil {
 			return
 		}
-
+		st := mgr.Stats()
+		a.mu.Lock()
+		if a.manager != mgr || ctx.Err() != nil {
+			a.mu.Unlock()
+			return
+		}
+		a.stats = st
+		connAt, settings := a.connectedAt, a.settings
+		systray.SetTooltip(buildTooltip(time.Since(connAt), st, settings))
+		a.mu.Unlock()
+		a.maybeAutoRefresh(st)
+		networkTick++
+		if networkTick%5 != 0 {
+			continue
+		}
 		if url := mgr.PendingCaptchaURL(); url != "" && !a.solvingCaptcha.Swap(true) {
 			go func() {
 				defer a.solvingCaptcha.Store(false)
 				a.handleCaptcha(ctx, mgr, url)
 			}()
 		}
-
 		mgr.CheckNetworkChange()
-
-		systray.SetTooltip(buildTooltip(time.Since(connAt), mgr.Stats(), a.settings))
 	}
 }
 
@@ -564,6 +739,9 @@ func (a *App) handleCaptcha(ctx context.Context, mgr *winbridge.Manager, url str
 // ── UI state ───────────────────────────────────────────────────────────────────
 
 func (a *App) setConnecting() {
+	a.mu.Lock()
+	a.stats = winbridge.TunnelStats{}
+	a.mu.Unlock()
 	a.cancelBlink()
 	systray.SetIcon(assets.IconConnecting())
 	systray.SetTooltip("Подключение…")
@@ -571,7 +749,9 @@ func (a *App) setConnecting() {
 	a.mDisconnect.Enable()
 
 	done := make(chan struct{})
+	a.blinkMu.Lock()
 	a.stopBlink = func() { close(done) }
+	a.blinkMu.Unlock()
 	go func() {
 		ticker := time.NewTicker(600 * time.Millisecond)
 		defer ticker.Stop()
@@ -582,7 +762,7 @@ func (a *App) setConnecting() {
 				return
 			case <-ticker.C:
 				if on {
-					systray.SetIcon(assets.IconDisconnected())
+					systray.SetIcon(assets.IconConnectingDim())
 				} else {
 					systray.SetIcon(assets.IconConnecting())
 				}
@@ -592,14 +772,20 @@ func (a *App) setConnecting() {
 	}()
 }
 
-func (a *App) setConnected() {
-	a.cancelBlink()
+func (a *App) setConnected(mgr *winbridge.Manager) bool {
 	a.mu.Lock()
+	if a.manager != mgr || a.exiting.Load() {
+		a.mu.Unlock()
+		return false
+	}
 	a.connectedAt = time.Now()
-	a.mu.Unlock()
+	a.stats = winbridge.TunnelStats{Connected: true}
+	settings := a.settings
+	defer a.mu.Unlock()
+	a.cancelBlink()
 	systray.SetIcon(assets.IconConnected())
-	if a.settings.Mode == winbridge.ModeSOCKS {
-		addr := fmt.Sprintf("127.0.0.1:%d", a.settings.SocksPort)
+	if settings.Mode == winbridge.ModeSOCKS {
+		addr := fmt.Sprintf("127.0.0.1:%d", settings.SocksPort)
 		systray.SetTooltip("SOCKS прокси " + addr)
 		go Notify("SOCKS прокси", "Запущен на "+addr, niifInfo)
 	} else {
@@ -608,9 +794,15 @@ func (a *App) setConnected() {
 	}
 	a.mConnect.Disable()
 	a.mDisconnect.Enable()
+	return true
 }
 
 func (a *App) setDisconnected() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.manager != nil {
+		return
+	}
 	a.cancelBlink()
 	systray.SetIcon(assets.IconDisconnected())
 	systray.SetTooltip("Отключено")
@@ -620,6 +812,8 @@ func (a *App) setDisconnected() {
 }
 
 func (a *App) cancelBlink() {
+	a.blinkMu.Lock()
+	defer a.blinkMu.Unlock()
 	if a.stopBlink != nil {
 		a.stopBlink()
 		a.stopBlink = nil

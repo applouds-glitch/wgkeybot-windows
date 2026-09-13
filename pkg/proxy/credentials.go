@@ -8,6 +8,7 @@ package proxy
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,7 +34,19 @@ type StreamCredentialsCache struct {
 }
 
 const (
-	credentialLifetime = 10 * time.Minute
+	// credentialLifetime is the fallback TTL used when the VK API reports no
+	// lifetime of its own — which is what it always does in practice
+	// (api_ttl=0s in every "Credentials cached until" log line), so this is the
+	// TTL. It is deliberately generous: guessing low is the expensive mistake.
+	// A stream that dies after more than one TTL forces a full four-step VK
+	// re-auth even though the credential is demonstrably still good (logs show
+	// cache slots living 46m and 3h between fetches), and every extra VK
+	// request is captcha exposure. Guessing high costs one Allocate that comes
+	// back "error 401: Unauthorized" — classifyCredError matches it,
+	// refreshGroupCreds force-expires the slot, and the worker's sub-second
+	// retry fetches a fresh credential. Bounded downside, so prefer the long
+	// TTL and let the error path drive the re-fetch.
+	credentialLifetime = 60 * time.Minute
 	cacheSafetyMargin  = 60 * time.Second
 	// credRefreshThrottle is the minimum gap between error-driven credential
 	// re-fetches for one cache slot. The first worker in a slot that hits an
@@ -44,11 +57,28 @@ const (
 
 // streamsPerCred — number of streams sharing one credential cache slot.
 // Also used as StreamsPerGroup in StartTunnelGroups.
-var streamsPerCred = 4
+//
+// Stored atomically because the proxy start path writes it for the session it is
+// starting while workers of the previous session — cancelled, but not yet
+// drained — are still reading it through getCacheID/fetchCreds. As a plain int
+// that is a data race, and a torn or stale read sends a departing worker to the
+// wrong cache slot.
+var streamsPerCred atomic.Int64
+
+func init() { streamsPerCred.Store(4) }
+
+func streamsPerCredValue() int { return int(streamsPerCred.Load()) }
+
+func setStreamsPerCred(n int) {
+	if n < 1 {
+		n = 1
+	}
+	streamsPerCred.Store(int64(n))
+}
 
 // getCacheID maps a stream ID to its shared credential cache slot.
 func getCacheID(streamID int) int {
-	return streamID / streamsPerCred
+	return streamID / streamsPerCredValue()
 }
 
 var credentialsStore = struct {
@@ -83,7 +113,7 @@ func invalidateAllCaches() {
 	credentialsStore.mu.Lock()
 	defer credentialsStore.mu.Unlock()
 	credentialsStore.caches = make(map[int]*StreamCredentialsCache)
-	turnLog("[Auth] All credential caches cleared (streamsPerCred=%d)", streamsPerCred)
+	turnLog("[Auth] All credential caches cleared (streamsPerCred=%d)", streamsPerCredValue())
 }
 
 // ActiveTURNAddrs returns all unique TURN server addresses (host:port) across
@@ -120,7 +150,7 @@ func ActiveTURNAddrs() []string {
 // (the first re-fetches, the rest get a cache hit). Called when the TURN server
 // rejects allocations for this credential (stale/401/486).
 func invalidateGroupCreds(groupID int) {
-	cache := getStreamCache(groupID * streamsPerCred)
+	cache := getStreamCache(groupID * streamsPerCredValue())
 	cache.mutex.Lock()
 	var lived time.Duration
 	if !cache.creds.FetchedAt.IsZero() {
@@ -137,7 +167,7 @@ func invalidateGroupCreds(groupID int) {
 // reuse the credential the first worker's next getCredsCached fetches. Throttle
 // state lives behind refreshMu so the decision is independent of the creds lock.
 func refreshGroupCreds(groupID int) {
-	cache := getStreamCache(groupID * streamsPerCred)
+	cache := getStreamCache(groupID * streamsPerCredValue())
 
 	cache.refreshMu.Lock()
 	if !cache.lastRefresh.IsZero() && time.Since(cache.lastRefresh) < credRefreshThrottle {

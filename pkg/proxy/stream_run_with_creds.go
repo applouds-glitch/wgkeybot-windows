@@ -7,14 +7,73 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
 )
+
+// errDataPlaneHandshake marks the one failure the static assignment used to be
+// blind to: Allocate succeeded, so the control plane and the credential are
+// fine, and the transport handshake through the relay still never completed.
+// Every transport wraps its handshake failure with this so runSession can tell
+// it apart from a session that ran and then broke.
+var errDataPlaneHandshake = errors.New("data-plane handshake failed")
+
+// sessionVerdict is what a finished session says about the server it ran on.
+type sessionVerdict int
+
+const (
+	// verdictNone: the session says nothing — we tore it down ourselves, or it
+	// ended cleanly without lasting long enough to prove anything.
+	verdictNone sessionVerdict = iota
+	verdictSuccess
+	verdictFailure
+	// verdictHandshakeFailure: allocated, then never completed the transport
+	// handshake. Acted on immediately rather than through the streak.
+	verdictHandshakeFailure
+)
+
+func (v sessionVerdict) String() string {
+	switch v {
+	case verdictSuccess:
+		return "success"
+	case verdictFailure:
+		return "failure"
+	case verdictHandshakeFailure:
+		return "handshake-failure"
+	default:
+		return "none"
+	}
+}
+
+// sessionOutcome grades a finished session for the health accounting in
+// turn_server_health.go.
+//
+// A blackholed allocation is the clearest verdict there is: the control plane
+// answered, so the credential and the path are fine, and the host still ate the
+// traffic. Otherwise a session that ran for a while proves the server works, and
+// a short one that ended in an error counts against it. Teardowns are excluded —
+// cancelled means cancelled by us, not by the server.
+func sessionOutcome(cancelled, blackholed bool, dur time.Duration, err error) sessionVerdict {
+	switch {
+	case cancelled:
+		return verdictNone
+	case blackholed:
+		return verdictFailure
+	case dur >= healthySessionDuration:
+		return verdictSuccess
+	case errors.Is(err, errDataPlaneHandshake):
+		return verdictHandshakeFailure
+	case err != nil:
+		return verdictFailure
+	default:
+		return verdictNone
+	}
+}
 
 // winner holds a successfully allocated TURN session from the race in
 // runWithCreds. The fields are the live resources handed off to the session:
@@ -23,24 +82,25 @@ type winner struct {
 	client *turn.Client
 	raw    net.Conn       // underlying dialed UDP/TCP conn
 	relay  net.PacketConn // relay allocation from client.Allocate()
-	addr   string         // TURN server that won
+	addr   string         // TURN server the session runs on
 	rtt    time.Duration  // Dial → Allocate latency
+	perm   *permWatch     // control-plane blackhole detector for this session
 }
 
-// runWithCreds establishes one TURN session with pre-fetched credentials,
-// racing the candidate servers ICE-style. With raceAll every server is dialed
-// at once to elect the genuinely fastest — a one-off probe done by the first
-// connection in a group. Otherwise the preferred server (addrs[0]) gets a
-// head-start and the rest are raced only if it does not win within
-// preferredHeadStart (failover, not a probe). The first server to complete
-// Allocate wins; the losers are cancelled/closed. Retry and credential rotation
-// are managed by the calling WorkerGroup.
-func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []string, cfg WorkerGroupConfig, raceAll bool) error {
+// runWithCreds establishes one TURN session with pre-fetched credentials on the
+// stream's assigned server, addrs[0] (see assignServers). There is no latency
+// race: only if that server fails to Allocate are the remaining candidates
+// dialed, all at once, and the first of those to complete Allocate takes the
+// session while the others are cancelled/closed. The assignment is per attempt,
+// so the next reconnect goes back to the stream's own server. Retry and
+// credential rotation are managed by the calling WorkerGroup.
+func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []string, cfg WorkerGroupConfig) error {
 	s.ready.Store(false)
 	defer s.ready.Store(false)
 
 	// raceCtx is cancelled the moment a winner is chosen (or ctx dies) so the
-	// losing racers stop dialing / abort their semaphore wait promptly.
+	// losing failover candidates stop dialing / abort their semaphore wait
+	// promptly.
 	raceCtx, cancelRace := context.WithCancel(ctx)
 	defer cancelRace()
 
@@ -53,7 +113,7 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []st
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			client, raw, relay, rtt, err := dialAndAllocate(raceCtx, s, user, pass, addr, cfg)
+			client, raw, relay, rtt, perm, err := dialAndAllocate(raceCtx, s, user, pass, addr, cfg)
 			if err != nil {
 				errCh <- err
 				return
@@ -62,13 +122,13 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []st
 			once.Do(func() {
 				claimed = true
 				cancelRace()
-				winCh <- winner{client: client, raw: raw, relay: relay, addr: addr, rtt: rtt}
+				winCh <- winner{client: client, raw: raw, relay: relay, addr: addr, rtt: rtt, perm: perm}
 			})
 			if !claimed {
-				// Another server won first: log this server's RTT for the
-				// A-vs-B comparison, then release the surplus allocation
+				// Another failover candidate got there first: log this
+				// server's RTT, then release the surplus allocation
 				// (relayConn.Close → Refresh(lifetime=0) deallocates server-side).
-				turnLog("[STREAM %d] Race lost by %s rtt=%v (group %d)", s.id, addr, rtt, cfg.GroupID)
+				turnLog("[STREAM %d] Failover candidate %s lost rtt=%v (group %d)", s.id, addr, rtt, cfg.GroupID)
 				relay.Close()
 				client.Close()
 				raw.Close()
@@ -80,7 +140,6 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []st
 	launchedCount := 1
 	fannedOut := len(addrs) == 1
 
-	var grace <-chan time.Time
 	fanOut := func() {
 		if fannedOut {
 			return
@@ -90,18 +149,6 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []st
 			launchedCount++
 		}
 		fannedOut = true
-		grace = nil
-	}
-
-	if raceAll {
-		// Probe: race every server at once to elect the genuinely fastest.
-		fanOut()
-	} else if !fannedOut {
-		// Head-start: let the preferred server (addrs[0]) try to win alone;
-		// fan out to the rest only if it does not win within the grace window.
-		t := time.NewTimer(preferredHeadStart)
-		defer t.Stop()
-		grace = t.C
 	}
 
 	var lastErr error
@@ -114,13 +161,17 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []st
 			lastErr = err
 			errCount++
 			if !fannedOut {
-				// Preferred failed before the grace window: race the rest now.
+				// The assigned server failed: try the failover candidates. Say
+				// why before moving on — a failover that succeeds swallows this
+				// error otherwise (only "all servers failed" ever surfaces it),
+				// and an elected server refusing Allocate on every reconnect was
+				// invisible in the log except as a second Dial line one RTT later.
+				turnLog("[STREAM %d] %s failed (%v) — fanning out to %v (group %d)",
+					s.id, addrs[0], err, addrs[1:], cfg.GroupID)
 				fanOut()
 			} else if errCount == launchedCount {
 				return fmt.Errorf("TURN allocate: all %d servers failed: %w", len(addrs), lastErr)
 			}
-		case <-grace:
-			fanOut()
 		case <-ctx.Done():
 			cancelRace()
 			// A racer may still win after we leave; reap it so the allocation
@@ -132,12 +183,21 @@ func (s *stream) runWithCreds(ctx context.Context, user, pass string, addrs []st
 }
 
 // dialAndAllocate dials one TURN server and performs the Allocate handshake,
-// measuring the Dial→Allocate latency. On any error it closes whatever it
-// opened and returns. On success the caller owns client/raw/relay. Uses ctx for
-// the dial and the allocSemaphore wait so a cancelled race aborts promptly.
-func dialAndAllocate(ctx context.Context, s *stream, user, pass, addr string, cfg WorkerGroupConfig) (*turn.Client, net.Conn, net.PacketConn, time.Duration, error) {
+// measuring the Dial→Allocate latency — the network part only, not the time
+// spent queued on allocSemaphore, which said nothing about the server and once
+// booked a 6s "rtt" against a relay that answered in 230ms. On any error it
+// closes whatever it opened and returns. On success the caller owns
+// client/raw/relay. Uses ctx for the dial, the allocSemaphore wait and the
+// Allocate itself so a cancelled race aborts promptly.
+//
+// Each attempt gets its own permWatch, wired into the pion logger factory
+// before NewClient so it sees the allocation's whole lifecycle. Losing failover
+// candidates simply drop theirs — a permWatch owns no goroutine, so an unwatched
+// one costs nothing.
+func dialAndAllocate(ctx context.Context, s *stream, user, pass, addr string, cfg WorkerGroupConfig) (*turn.Client, net.Conn, net.PacketConn, time.Duration, *permWatch, error) {
 	turnLog("[STREAM %d] Dial TURN %s (group %d)", s.id, addr, cfg.GroupID)
-	start := time.Now()
+	dialStart := time.Now()
+	perm := newPermWatch(s.id)
 
 	dialer := &net.Dialer{
 		Timeout: 30 * time.Second,
@@ -149,14 +209,14 @@ func dialAndAllocate(ctx context.Context, s *stream, user, pass, addr string, cf
 	if cfg.UseUDP {
 		c, err := dialer.DialContext(ctx, "udp", addr)
 		if err != nil {
-			return nil, nil, nil, 0, fmt.Errorf("TURN UDP dial: %w", err)
+			return nil, nil, nil, 0, nil, fmt.Errorf("TURN UDP dial: %w", err)
 		}
 		raw = c
 		turnConn = &connectedUDPConn{c.(*net.UDPConn)}
 	} else {
 		c, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			return nil, nil, nil, 0, fmt.Errorf("TURN TCP dial: %w", err)
+			return nil, nil, nil, 0, nil, fmt.Errorf("TURN TCP dial: %w", err)
 		}
 		raw = c
 		turnConn = turn.NewSTUNConn(c)
@@ -168,64 +228,216 @@ func dialAndAllocate(ctx context.Context, s *stream, user, pass, addr string, cf
 		Username:       user,
 		Password:       pass,
 		Conn:           turnConn,
-		LoggerFactory:  logging.NewDefaultLoggerFactory(),
+		// pion refreshes the peer permission every 120s by default. That is
+		// twice as often as it needs to be: the permission's lifetime is a
+		// fixed 300s (RFC 8656 section 9), so 240s renews it with a full 60s of
+		// margin while halving the transactions this costs — they are per stream
+		// and never coalesced with the 25s keepalive grid.
+		//
+		// Not disabled outright (free-turn-proxy sets 24h) because after the
+		// first WriteTo the data path never re-sends CreatePermission —
+		// createPermission short-circuits on permStatePermitted
+		// (internal/client/udp_conn.go:169) — leaving ChannelBind refresh as
+		// the only thing that reinstalls the permission. pion fires that at
+		// 300-330s (bindingRefreshInterval 5m, checked every 30s, condition is
+		// a strict >, and refreshedAt is stamped after the transaction), i.e.
+		// *after* the 300s permission has already lapsed. That would open a
+		// ~30s window every 5 minutes in which the relay may drop inbound —
+		// too short for the 90s dead-stream detector to catch, so it would
+		// surface as unexplained downstream loss rather than a failed stream.
+		// bindingRefreshInterval is unexported in ClientConfig, so the window
+		// cannot be closed from here.
+		//
+		// permWatch still sees this class of failure, just at 2x240s instead of
+		// 2x120s (~8 min). The faster detectors are unaffected: ChannelBind
+		// latches in ~60s and allocation refresh on a single failure.
+		PermissionRefreshInterval: 240 * time.Second,
+		LoggerFactory:             pionLogFactory{streamID: s.id, watch: perm},
 	})
 	if err != nil {
 		raw.Close()
-		return nil, nil, nil, 0, fmt.Errorf("TURN client: %w", err)
+		return nil, nil, nil, 0, nil, fmt.Errorf("TURN client: %w", err)
 	}
 
 	if err := client.Listen(); err != nil {
 		client.Close()
 		raw.Close()
-		return nil, nil, nil, 0, fmt.Errorf("TURN listen: %w", err)
+		return nil, nil, nil, 0, nil, fmt.Errorf("TURN listen: %w", err)
 	}
+
+	dialed := time.Since(dialStart)
 
 	select {
 	case allocSemaphore <- struct{}{}:
 	case <-ctx.Done():
 		client.Close()
 		raw.Close()
-		return nil, nil, nil, 0, ctx.Err()
+		return nil, nil, nil, 0, nil, ctx.Err()
 	}
-	relay, err := client.Allocate()
+	allocStart := time.Now()
+	relay, err := allocateWithDeadline(ctx, allocateSilenceTimeout, client.Allocate, func() {
+		client.Close()
+		raw.Close()
+	})
 	<-allocSemaphore
 	if err != nil {
 		client.Close()
 		raw.Close()
-		return nil, nil, nil, 0, fmt.Errorf("TURN allocate: %w", err)
+		// Only a genuine refusal counts against the server. A losing failover
+		// candidate — or any dial during a teardown — fails because we cancelled
+		// its context, which says nothing about the host.
+		if ctx.Err() == nil {
+			noteServerFailure(addr)
+		}
+		return nil, nil, nil, 0, nil, fmt.Errorf("TURN allocate: %w", err)
 	}
 
-	return client, raw, relay, time.Since(start), nil
+	return client, raw, relay, dialed + time.Since(allocStart), perm, nil
 }
 
-// runSession runs the relay session on the race winner and owns its lifecycle:
-// it closes the relay, client and underlying conn on exit (matching the
-// pre-race defer order). It also records the winning server as the group's
-// preferred (warm cache) for the next reconnect.
+// allocateSilenceTimeout bounds one Allocate. pion retransmits on its own
+// schedule (0.2/0.4/0.8/1.6/1.6/1.6/1.6s — 7.8s to "all retransmissions
+// failed"), which is built for a lossy path where the next copy may get
+// through. The failure seen in the field is not loss: on the same relay, in the
+// same second, one socket's Allocate got no answer to any of its seven copies
+// while its siblings' were answered in one round trip — a 5-tuple the server
+// (or a balancer in front of it) had blackholed, and retransmitting on it buys
+// nothing. Meanwhile that socket held one of the three allocSemaphore slots
+// for the whole 7.8s, queueing the healthy dials behind it: with two blackholed
+// first, streams 8 and 9 waited 5.5s for a slot, and a stream whose two
+// servers both drew a dead tuple spent 16s before its first retry.
+//
+// A normal Allocate is two round trips (401 challenge, then the authenticated
+// request), well under a second even on a slow path; 2s still leaves three of
+// pion's retransmits for genuine loss. Same figure as relayProofTimeout, the
+// data-plane verdict: the control plane is allowed no longer than the data
+// plane to prove the path.
+const allocateSilenceTimeout = 2 * time.Second
+
+var errAllocateSilent = errors.New("no answer to Allocate")
+
+// allocateWithDeadline runs allocate, giving up after timeout or when ctx is
+// cancelled. abort must make a pending allocate return promptly — for pion
+// that is Client.Close (fails the transaction being waited on) plus closing
+// the conn (fails a retransmit or a follow-up transaction that was racing the
+// close). A relay that allocate hands back after the deadline is closed here,
+// so the server-side allocation is released rather than leaked.
+func allocateWithDeadline(ctx context.Context, timeout time.Duration, allocate func() (net.PacketConn, error), abort func()) (net.PacketConn, error) {
+	type result struct {
+		relay net.PacketConn
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		relay, err := allocate()
+		done <- result{relay, err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return r.relay, r.err
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+
+	abort()
+	if r := <-done; r.relay != nil {
+		r.relay.Close()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("%w within %v", errAllocateSilent, timeout)
+}
+
+// runSession runs the relay session on the connected server and owns its
+// lifecycle: it closes the relay, client and underlying conn on exit.
 func (s *stream) runSession(ctx context.Context, w winner, cfg WorkerGroupConfig) error {
 	defer w.raw.Close()
 	defer w.client.Close()
 	defer w.relay.Close()
 
-	turnLog("[STREAM %d] Race won by %s rtt=%v (group %d)", s.id, w.addr, w.rtt, cfg.GroupID)
+	turnLog("[STREAM %d] TURN %s rtt=%v (group %d)", s.id, w.addr, w.rtt, cfg.GroupID)
 	turnLog("[STREAM %d] Relay: %s", s.id, w.relay.LocalAddr())
-	recordPreferred(cfg.GroupID, w.addr)
 
+	// Blackhole watchdog. When permWatch declares the allocation dead, close the
+	// relay: that is the one handle all three transports block on, so whichever
+	// loop owns this stream unwinds immediately instead of writing into a dead
+	// allocation until the 90s no-RX detector eventually notices — or never
+	// notices, because a shaped-but-alive path keeps the liveness clock fresh.
+	// Closing here also sends Refresh(lifetime=0), releasing the server-side
+	// allocation instead of leaving it to eat the credential's quota.
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+	go func() {
+		select {
+		case <-w.perm.deadCh():
+			turnLog("[STREAM %d] Recycling allocation after blackhole", s.id)
+			w.relay.Close()
+		case <-sessCtx.Done():
+		}
+	}()
+
+	// The transports report their own handshake success against this address
+	// (noteServerHandshakeOK), which is what lets a sibling's success vouch for
+	// the uplink when another server fails its handshake in the same window.
+	s.serverAddr = w.addr
+
+	// Stamped before the transport runs, so a server that goes on to prove its
+	// data plane already has a latency the election can rank it by.
+	noteServerRTT(w.addr, w.rtt)
+
+	started := time.Now()
+	var err error
 	switch cfg.PeerType {
 	case "wireguard":
-		return s.runNoDTLS(ctx, w.relay, cfg.PeerAddr)
+		err = s.runNoDTLS(ctx, w.relay, cfg.PeerAddr)
 	case "srtp":
-		return s.runSRTP(ctx, w.relay, cfg.PeerAddr)
+		err = s.runSRTP(ctx, w.relay, cfg.PeerAddr)
 	default:
-		return s.runDTLS(ctx, w.relay, cfg.PeerAddr, true)
+		err = s.runDTLS(ctx, w.relay, cfg.PeerAddr, true)
 	}
+
+	// Health accounting for the static assignment (see turn_server_health.go).
+	switch sessionOutcome(ctx.Err() != nil, w.perm.fired(), time.Since(started), err) {
+	case verdictSuccess:
+		noteServerSuccess(w.addr)
+	case verdictHandshakeFailure:
+		noteServerHandshakeFailure(w.addr, started)
+	case verdictFailure:
+		noteServerFailure(w.addr)
+	}
+
+	// A blackhole teardown surfaces as "use of closed network connection", which
+	// carries no diagnosis and — more importantly — no auth/quota wording for
+	// classifyCredError to act on. Restate it with pion's own message so a
+	// blackhole that was really a stale credential still rotates the credential.
+	// A nil err means the loops exited cleanly, which WorkerGroup would read as
+	// "server closed the stream": override it too, this was a failure.
+	//
+	// The cause is folded in with %s, not %w. classifyCredError is code-driven and
+	// bails out early on any error whose chain contains a *net.OpError (see
+	// isTransportError), and the relay we just closed ourselves puts exactly that
+	// in the chain. Wrapping would therefore route every blackhole down the
+	// "transport, not credential" branch and never rotate — which is the whole
+	// reason this restatement exists. Flattening to text keeps pion's wording
+	// ("error 401: Unauthorized") reachable by the substring fallback; nothing
+	// downstream matches on this error's chain.
+	if w.perm.fired() {
+		if err == nil {
+			return fmt.Errorf("TURN blackhole: %s", w.perm.why())
+		}
+		return fmt.Errorf("TURN blackhole: %s (%s)", w.perm.why(), err)
+	}
+	return err
 }
 
-// reapRace drains any late-arriving race winner (after the caller has given up
-// on ctx cancellation) and closes its resources so they don't leak. winCh holds
-// at most one winner (guarded by sync.Once), so a single non-blocking drain
-// after all racers have exited is sufficient.
+// reapRace drains any late-arriving winner (after the caller has given up on
+// ctx cancellation) and closes its resources so they don't leak. winCh holds at
+// most one winner (guarded by sync.Once), so a single non-blocking drain after
+// all dialers have exited is sufficient.
 func reapRace(wg *sync.WaitGroup, winCh chan winner) {
 	wg.Wait()
 	select {

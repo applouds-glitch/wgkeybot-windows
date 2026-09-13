@@ -23,7 +23,6 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
 	tlsclient "github.com/kiper292/tls-client"
-	"github.com/kiper292/tls-client/profiles"
 )
 
 // VKCredentials stores VK API client credentials
@@ -42,8 +41,94 @@ var vkCredentialsList = []VKCredentials{
 // vkCredRotation round-robins the starting credential across fetchVkCreds calls.
 var vkCredRotation atomic.Uint64
 
-// vkRequestMu serializes VK API requests to avoid flood control
+// vkRequestMu serializes the inter-request spacing that keeps VK's flood
+// control quiet. vkSemaphore (worker_group.go) bounds concurrency; the
+// time-based gap below spaces sequential token chains from different slots.
 var vkRequestMu sync.Mutex
+var globalLastVkFetchTime time.Time
+
+// globalCaptchaLockout blocks all VK credential fetches until this Unix time
+// when repeated captcha attempts fail. Prevents hammering VK when the captcha is
+// genuinely unsolvable — the next fetch will get a clean error immediately
+// instead of going through the full token chain just to hit captcha again.
+var globalCaptchaLockout atomic.Int64
+
+// captchaLockoutStreak counts consecutive unsolved captchas since the last
+// successful credential fetch. It drives the lockout duration: a flat 60s window
+// meant an unsolvable captcha re-opened the whole solve ladder — up to a visible
+// WebView2 window — every ~1.5 minutes for as long as the tunnel was up.
+var captchaLockoutStreak atomic.Int64
+
+const (
+	captchaLockoutBase = 60 * time.Second
+	captchaLockoutMax  = 10 * time.Minute
+)
+
+// errCaptchaUnsolved is returned when the whole solve ladder (HTTP auto → slider
+// POC → hidden WebView2 → visible window) ran and failed. errCaptchaLockout is
+// returned when a fetch was refused up-front because such a failure happened
+// recently. Workers treat them differently: only the former is evidence that the
+// captcha itself is unsolvable, so only it counts toward giving up. Both messages
+// still contain "CAPTCHA_WAIT_REQUIRED" — upstream's turn-client.go matches that
+// marker by substring to abort startup on a captcha wall; this repo's pre-fetch
+// does not have that check (see TestCaptchaErrorsKeepStartupMarker), but the
+// marker is kept so it stays available to whichever consumer needs it.
+var (
+	errCaptchaUnsolved = errors.New("CAPTCHA_WAIT_REQUIRED")
+	errCaptchaLockout  = errors.New("CAPTCHA_WAIT_REQUIRED: global lockout active")
+)
+
+// errCallRequiresAuth marks a call that refuses anonymous joins (VK error 9005).
+// Terminal for a worker. The startup path in turn-client.go matches it by
+// substring and returns -2, so the message text must keep saying
+// "CALL_REQUIRES_AUTH".
+var errCallRequiresAuth = errors.New("CALL_REQUIRES_AUTH")
+
+// bumpCaptchaLockout records one unsolved captcha and arms the global lockout
+// with an exponentially growing window (60s, 2m, 4m, 8m, capped at 10m).
+// Returns the window it armed, for logging.
+func bumpCaptchaLockout() time.Duration {
+	n := captchaLockoutStreak.Add(1)
+	shift := min(n-1, 4)
+	d := captchaLockoutBase << uint(shift)
+	if d > captchaLockoutMax {
+		d = captchaLockoutMax
+	}
+	globalCaptchaLockout.Store(time.Now().Add(d).Unix())
+	return d
+}
+
+// resetCaptchaLockout clears the lockout and its streak. Called whenever
+// credentials are obtained (the captcha gate is demonstrably passable again) and
+// on a fresh tunnel start.
+func resetCaptchaLockout() {
+	captchaLockoutStreak.Store(0)
+	globalCaptchaLockout.Store(0)
+}
+
+// captchaFailureStreak reports how many captcha solve ladders have failed in a
+// row since the last successful credential fetch. Session-wide on purpose: the
+// ladder is serialised globally (requestCaptchaSerialized), so the workers take
+// turns running it, and a per-worker count would need N times as many failures —
+// and N times as many windows — to conclude the obvious.
+func captchaFailureStreak() int {
+	return int(captchaLockoutStreak.Load())
+}
+
+// captchaLockoutRemaining reports how long the global lockout still blocks
+// fetches, or 0 if it is not armed. Workers sleep this out instead of retrying
+// on a fixed cadence that the lockout would only reject again.
+func captchaLockoutRemaining() time.Duration {
+	ts := globalCaptchaLockout.Load()
+	if ts <= 0 {
+		return 0
+	}
+	d := time.Until(time.Unix(ts, 0))
+	if d < 0 {
+		return 0
+	}
+	return d
+}
 
 // captchaTokenReuse is how many times one solved success_token may be reused
 // across streams of the same link. Startup pre-fetches every stream in parallel,
@@ -144,6 +229,12 @@ const (
 // slider POC". Must stay byte-for-byte in sync with the Kotlin constant.
 const captchaSliderSentinel = "__WGK_SLIDER_DETECTED__"
 
+// maxTokenChainRounds bounds the getAnonymousToken request loop. Normal traffic
+// needs 1 round (no captcha) or 2-4 (captcha solved, resubmit); the error-10
+// path adds at most 3 more. Anything beyond that is a loop that is not
+// converging, and every extra round costs a captcha solve attempt.
+const maxTokenChainRounds = 10
+
 // captchaSolveModeForAttempt returns the next captcha solve mode for a given attempt.
 // Order: HTTP auto → manual (browser/WebView) → manual visible (dialog).
 // captchaSolveModeSliderPOC is intentionally NOT in this list — it is invoked
@@ -213,10 +304,20 @@ func getCustomDialContext(ctx context.Context, network, addr string) (net.Conn, 
 // fetchVkCreds performs the actual VK/OK API calls to fetch credentials.
 // Returns (username, password, serverAddrs, lifetimeSecs, error).
 func fetchVkCreds(ctx context.Context, link string) (string, string, []string, int, error) {
+	// One identity for the whole session: the UA, the client hints and the
+	// ClientHello all come from the same Chrome major (vkSessionIdentity in
+	// profiles.go), so the transport cannot claim a different browser than the
+	// headers do, and the captcha phase cannot claim a different one than the
+	// phase that triggered it.
+	profile, chromeMajor := vkSessionIdentity()
+
 	client, err := tlsclient.NewHttpClient(
 		tlsclient.NewNoopLogger(),
 		tlsclient.WithTimeoutSeconds(20),
-		tlsclient.WithClientProfile(profiles.Chrome_146),
+		// ClientHello matching the session's Chrome major (vk_tls_clienthello.go)
+		// + random extension order: the combination VK's bot detector accepts.
+		tlsclient.WithClientProfile(vkChromeClientProfile(chromeMajor)),
+		tlsclient.WithRandomTLSExtensionOrder(),
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
 		tlsclient.WithDialer(getCustomNetDialer()),
 		tlsclient.WithDialContext(getCustomDialContext),
@@ -230,19 +331,15 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 	}
 	defer client.CloseIdleConnections()
 
-	profile := Profile{
-		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
-		SecChUaMobile:   "?0",
-		SecChUaPlatform: `"Windows"`,
-		AcceptLanguage:  "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-	}
+	turnLog("[VK Auth] Session identity: Chrome/%d (ClientHello + UA)", chromeMajor)
 
 	// Primary path: VK Calls anonymous flow — no captcha. The legacy captcha
 	// chain below stays as insurance for when this flow breaks (VK changes the
 	// messages.* endpoints, or a captcha gate appears even here).
 	if user, pass, addr, lifetime, vkErr := getVKCredsViaVKCalls(ctx, link, client, profile); vkErr == nil {
 		turnLog("[VK Auth] Success via VK Calls anonymous flow (no captcha)")
+		// Credentials in hand — the captcha gate is demonstrably passable again.
+		resetCaptchaLockout()
 		return user, pass, addr, lifetime, nil
 	} else if isCallUnavailable(vkErr) {
 		// Dead/deleted call or invalid join link. The legacy captcha chain below
@@ -254,18 +351,61 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 		turnLog("[VK Auth] VK Calls flow failed (%v) — falling back to legacy captcha path", vkErr)
 	}
 
+	// Guards only the legacy path: if repeated captcha attempts just failed,
+	// there is nothing a full token chain can do except hit the same gate again.
+	if remaining := captchaLockoutRemaining(); remaining > 0 {
+		return "", "", nil, 0, fmt.Errorf("%w (%v left)", errCaptchaLockout, remaining.Round(time.Second))
+	}
+
 	var lastErr error
 	start := int(vkCredRotation.Add(1) - 1)
 	for i := 0; i < len(vkCredentialsList); i++ {
 		creds := vkCredentialsList[(start+i)%len(vkCredentialsList)]
+		// Inter-request gap (3-6s): enforces a minimum spacing between the END
+		// of one getTokenChain and the START of the next, even when different
+		// credential slots race via vkSemaphore(2). The mutex is held only
+		// around the gap calculation and the timestamp update — getTokenChain
+		// itself runs unlocked, so a blocking captcha window in one goroutine
+		// never stalls another group's fetches.
+		vkRequestMu.Lock()
+		for !globalLastVkFetchTime.IsZero() {
+			minGap := 3*time.Second + time.Duration(rand.Intn(3000))*time.Millisecond
+			wait := time.Until(globalLastVkFetchTime.Add(minGap))
+			if wait <= 0 {
+				break
+			}
+			vkRequestMu.Unlock()
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return "", "", nil, 0, ctx.Err()
+			}
+			vkRequestMu.Lock()
+		}
+		vkRequestMu.Unlock()
+
 		user, pass, addrs, lifetime, err := getTokenChain(ctx, link, creds, client, profile)
+
+		vkRequestMu.Lock()
+		globalLastVkFetchTime = time.Now()
+		vkRequestMu.Unlock()
 		if err == nil {
+			// Credentials in hand — the captcha gate is demonstrably passable again.
+			resetCaptchaLockout()
 			return user, pass, addrs, lifetime, nil
 		}
 		if isCallUnavailable(err) {
 			// The call itself is gone — rotating to another credential slot would
 			// hit the same dead call. Stop and surface as terminal.
 			turnLog("[VK Auth] Legacy: call unavailable (%v) — not rotating credentials", err)
+			return "", "", nil, 0, err
+		}
+		if errors.Is(err, errCaptchaUnsolved) {
+			// The captcha gate is tied to this client/session, not to the VK app
+			// credential, so the next slot would open the very same solve ladder —
+			// a second WebView2 window inside one fetch, and a second bump of the
+			// lockout. Surface it and let the worker's backoff do the waiting.
+			turnLog("[VK Auth] Legacy: captcha unsolved — not rotating credentials")
 			return "", "", nil, 0, err
 		}
 		lastErr = err
@@ -296,12 +436,19 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 		applyBrowserProfileFhttp(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Origin", "https://vk.com")
-		req.Header.Set("Referer", "https://vk.com/")
+		req.Header.Set("Origin", "https://vk.ru")
+		req.Header.Set("Referer", "https://vk.ru/")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Priority", "u=1, i")
+		// Same transport as the captcha phase (vk_captcha.go): this is the chain
+		// that makes VK decide whether to demand a captcha at all, and the one
+		// that submits the success_token afterwards. Leaving it on fhttp's
+		// default header order meant the two phases of one session presented two
+		// different browsers.
+		req.Header[fhttp.HeaderOrderKey] = vkXHRHeaderOrder
+		req.Header[fhttp.PHeaderOrderKey] = vkPHeaderOrder
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -325,15 +472,45 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 		return resp, nil
 	}
 
+	// refreshAnonymToken fetches a fresh token1. Used during error 10 retries
+	// when the original token may have expired during captcha solving.
+	refreshAnonymToken := func() (string, error) {
+		data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", creds.ClientID, creds.ClientSecret, creds.ClientID)
+		resp, err := doRequest(data, "https://login.vk.ru/?act=get_anonym_token")
+		if err != nil {
+			return "", err
+		}
+		if errMsg, ok := resp["error"].(map[string]interface{}); ok {
+			return "", fmt.Errorf("VK API error: %v", errMsg)
+		}
+		dataRaw, ok := resp["data"]
+		if !ok {
+			return "", fmt.Errorf("'data' not found in response")
+		}
+		dataMap, ok := dataRaw.(map[string]interface{})
+		if !ok || dataMap == nil {
+			return "", fmt.Errorf("invalid response structure: %v", resp)
+		}
+		token, ok := dataMap["access_token"]
+		if !ok {
+			return "", fmt.Errorf("access_token not found")
+		}
+		tokenStr, ok := token.(string)
+		if !ok {
+			return "", fmt.Errorf("access_token is not a string: %v", token)
+		}
+		return tokenStr, nil
+	}
+
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
 
 	// Token 1
 	// Keep token_type=messages: VK's scopes variant of get_anonym_token mints an
 	// OAuth-only token that getAnonymousToken rejects with anonym_token.not_found.
-	// Only the host moved to vk.com, not the params.
+	// Only the host moved between the vk.com and vk.ru families, not the params.
 	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", creds.ClientID, creds.ClientSecret, creds.ClientID)
-	resp, err := doRequest(data, "https://login.vk.com/?act=get_anonym_token")
+	resp, err := doRequest(data, "https://login.vk.ru/?act=get_anonym_token")
 	if err != nil {
 		turnLog("[VK Auth] Token 1 request failed: %v", err)
 		return "", "", nil, 0, err
@@ -363,8 +540,8 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 	vkDelayRandom(100, 150)
 
 	// getCallPreview — имитация поведения VK-клиента перед запросом токена звонка
-	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
-	_, err = doRequest(data, fmt.Sprintf("https://api.vk.com/method/calls.getCallPreview?v=5.282&client_id=%s", creds.ClientID))
+	data = fmt.Sprintf("vk_join_link=https://vk.ru/call/join/%s&fields=photo_200&access_token=%s", link, token1)
+	_, err = doRequest(data, fmt.Sprintf("https://api.vk.ru/method/calls.getCallPreview?v=5.282&client_id=%s", creds.ClientID))
 	if err != nil {
 		turnLog("[VK Auth] getCallPreview warning: %v", err)
 	}
@@ -372,8 +549,8 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 	vkDelayRandom(200, 400)
 
 	// Token 2
-	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
-	urlAddr := fmt.Sprintf("https://api.vk.com/method/calls.getAnonymousToken?v=5.282&client_id=%s", creds.ClientID)
+	data = fmt.Sprintf("vk_join_link=https://vk.ru/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
+	urlAddr := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.282&client_id=%s", creds.ClientID)
 
 	enableManual := true
 	// Windows: SolveCaptchaProxy already escalates to a visible dialog on timeout,
@@ -400,7 +577,17 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 
 	var token2 string
 	var retryErr10 int
+	captchaSolveAttempt := 0 // ladder index for the current captcha (reset after a solve)
 	for attempt := 0; ; attempt++ {
+		// Hard bound on the round trip count. Every path that keeps the loop alive
+		// (a solved captcha, an error-10 retry) resets some counter of its own, so
+		// without this the loop has no terminating condition at all — a single
+		// fetch could re-run the solve ladder, window included, indefinitely.
+		if attempt >= maxTokenChainRounds {
+			window := bumpCaptchaLockout()
+			turnLog("[STREAM %d] [Captcha] Giving up after %d token-chain rounds — lockout %v", streamID, attempt, window)
+			return "", "", nil, 0, fmt.Errorf("%w: token chain did not converge", errCaptchaUnsolved)
+		}
 		resp, err = doRequest(data, urlAddr)
 		if err != nil {
 			return "", "", nil, 0, err
@@ -414,7 +601,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				}
 			}
 			if errCode, ok2 := errObj["error_code"].(float64); ok2 && int(errCode) == 9005 {
-				return "", "", nil, 0, fmt.Errorf("CALL_REQUIRES_AUTH")
+				return "", "", nil, 0, errCallRequiresAuth
 			}
 			// Other 9xxx call-domain errors on getAnonymousToken mean the call is
 			// gone (ended/deleted) or the join link is invalid — terminal, no
@@ -432,18 +619,20 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 					cachedSuccessToken = ""
 					data = baseData
 				}
-				solveMode, hasSolveMode := captchaSolveModeForAttempt(attempt, enableManual, enableManualVisible, autoCaptchaSliderPOC)
+				solveMode, hasSolveMode := captchaSolveModeForAttempt(captchaSolveAttempt, enableManual, enableManualVisible, autoCaptchaSliderPOC)
 				// If slider POC already failed on a slider-confirmed captcha, the
 				// invisible WebView can't solve it either — skip straight to the
 				// visible dialog.
 				if sliderEscalationFailed && solveMode == captchaSolveModeManual {
 					turnLog("[STREAM %d] [Captcha] Skipping invisible WebView (slider unsolved) — jumping to visible dialog", streamID)
-					attempt++
-					solveMode, hasSolveMode = captchaSolveModeForAttempt(attempt, enableManual, enableManualVisible, autoCaptchaSliderPOC)
+					captchaSolveAttempt++
+					solveMode, hasSolveMode = captchaSolveModeForAttempt(captchaSolveAttempt, enableManual, enableManualVisible, autoCaptchaSliderPOC)
 				}
 				if !hasSolveMode {
-					turnLog("[STREAM %d] [Captcha] No more solve modes available (attempt %d)", streamID, attempt+1)
-					return "", "", nil, 0, fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
+					turnLog("[STREAM %d] [Captcha] No more solve modes available (attempt %d)", streamID, captchaSolveAttempt+1)
+					window := bumpCaptchaLockout()
+					turnLog("[STREAM %d] [Captcha] Solve ladder exhausted — lockout %v", streamID, window)
+					return "", "", nil, 0, fmt.Errorf("%w: solve ladder exhausted", errCaptchaUnsolved)
 				}
 
 				var successToken string
@@ -529,18 +718,23 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				}
 
 				if solveErr != nil {
-					turnLog("[STREAM %d] [Captcha] %s failed (attempt %d): %v", streamID, captchaSolveModeLabel(solveMode), attempt+1, solveErr)
-					nextSolveMode, hasNextSolveMode := captchaSolveModeForAttempt(attempt+1, enableManual, enableManualVisible, autoCaptchaSliderPOC)
+					turnLog("[STREAM %d] [Captcha] %s failed (attempt %d): %v", streamID, captchaSolveModeLabel(solveMode), captchaSolveAttempt+1, solveErr)
+					captchaSolveAttempt++
+					nextSolveMode, hasNextSolveMode := captchaSolveModeForAttempt(captchaSolveAttempt, enableManual, enableManualVisible, autoCaptchaSliderPOC)
 					if hasNextSolveMode {
 						turnLog("[STREAM %d] [Captcha] Falling back to %s...", streamID, captchaSolveModeLabel(nextSolveMode))
 						continue
 					}
-					return "", "", nil, 0, fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
+					window := bumpCaptchaLockout()
+					turnLog("[STREAM %d] [Captcha] Solve ladder exhausted — lockout %v", streamID, window)
+					return "", "", nil, 0, fmt.Errorf("%w: solve ladder exhausted", errCaptchaUnsolved)
 				}
 
 				if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
 					captchaErr.CaptchaAttempt = "1"
 				}
+
+				captchaSolveAttempt = 0 // the next captcha in this chain starts the ladder afresh
 
 				// Resubmit getAnonymousToken with the full captcha context, exactly
 				// like the Android client does. VK needs captcha_sid + captcha_ts +
@@ -549,7 +743,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				// it just re-issues the captcha (which looked like the window popping
 				// up again after a solve).
 				data = fmt.Sprintf(
-					"vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
+					"vk_join_link=https://vk.ru/call/join/%s&name=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
 					link, escapedName, captchaErr.CaptchaSid, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt, token1)
 				// Also cache for reuse across streams.
 				pushCaptchaToken(link, successToken, captchaTokenReuse)
@@ -568,8 +762,20 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 					return "", "", nil, 0, ctx.Err()
 				case <-time.After(time.Duration(waitSec) * time.Second):
 				}
+				// The anonym_token (token1) may have expired during captcha
+				// solving — refresh it so VK doesn't reject the retry with
+				// another error 10.
+				newToken1, refreshErr := refreshAnonymToken()
+				if refreshErr == nil && newToken1 != "" {
+					token1 = newToken1
+					turnLog("[STREAM %d] Token1 refreshed for retry %d", streamID, retryErr10)
+				} else {
+					turnLog("[STREAM %d] Token1 refresh failed for retry %d, reusing existing token1: %v", streamID, retryErr10, refreshErr)
+				}
 				// Reset to base data so VK issues a new captcha that auto-solver can handle.
-				data = baseData
+				data = fmt.Sprintf("vk_join_link=https://vk.ru/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
+				baseData = data
+				captchaSolveAttempt = 0
 				attempt = -1 // loop header will increment to 0
 				continue
 			}

@@ -3,80 +3,53 @@
 package tray
 
 import (
-	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
-	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-// psRun runs a PowerShell script without showing a console window.
-func psRun(script string) ([]byte, error) {
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
-	return cmd.Output()
-}
-
-// PickConfFile opens a Windows file picker dialog and returns the selected .conf path.
-// Returns empty string if the user cancels.
-func PickConfFile(initialDir string) (string, error) {
-	script := fmt.Sprintf(`
-Add-Type -AssemblyName System.Windows.Forms
-$d = New-Object System.Windows.Forms.OpenFileDialog
-$d.Title  = 'WgKeyBot — Select WireGuard config'
-$d.Filter = 'WireGuard config (*.conf)|*.conf|All files (*.*)|*.*'
-$d.InitialDirectory = '%s'
-if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }
-`, escapePS(initialDir))
-	out, err := psRun(script)
-	if err != nil {
-		return "", fmt.Errorf("file picker: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// InputDialog shows a Windows VisualBasic InputBox and returns the entered text.
-// Returns empty string if the user cancels.
+// InputDialog uses native controls on its own message thread. Unicode input
+// no longer depends on the encoding of a PowerShell child process.
 func InputDialog(title, prompt string) (string, error) {
-	script := fmt.Sprintf(`
-Add-Type -AssemblyName Microsoft.VisualBasic
-$r = [Microsoft.VisualBasic.Interaction]::InputBox('%s', '%s', '')
-Write-Output $r
-`, escapePS(prompt), escapePS(title))
-	out, err := psRun(script)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	w, err := newNativeWindow(title, 472, 152, 0)
 	if err != nil {
-		return "", fmt.Errorf("input dialog: %w", err)
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	defer w.dispose()
+	w.label(prompt, 20, 18, 432, 24, 0)
+	edit := w.add("EDIT", "", 0x00800000|0x0080|wsTabstop, 0, 20, 50, 432, 28, 0)
+	pSendMessage.Call(edit.hwnd, 0x00c5, 4096, 0) // EM_SETLIMITTEXT
+	w.add("BUTTON", "Импортировать", 1|wsTabstop, 1, 196, 100, 150, 32, 0)
+	w.add("BUTTON", "Отмена", wsTabstop, 2, 356, 100, 96, 32, 0)
+	var result string
+	w.command = func(id int) {
+		switch id {
+		case 1:
+			var buf [4097]uint16
+			pGetWindowText.Call(edit.hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+			result = strings.TrimSpace(windows.UTF16ToString(buf[:]))
+			pDestroyWindow.Call(w.hwnd)
+		case 2:
+			pDestroyWindow.Call(w.hwnd)
+		}
+	}
+	w.show()
+	pSetFocus.Call(edit.hwnd)
+	err = w.run()
+	return result, err
 }
 
-// ShowError shows a Windows error MessageBox (non-blocking — runs in background).
 func ShowError(title, message string) {
-	script := fmt.Sprintf(`
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show('%s', '%s', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-`, escapePS(message), escapePS(title))
-	psRun(script) //nolint:errcheck
+	windows.MessageBox(0, nativeString(message), nativeString(title), 0x00000010|0x00010000)
 }
 
-// ShowInfo shows a Windows info MessageBox.
 func ShowInfo(title, message string) {
-	script := fmt.Sprintf(`
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show('%s', '%s', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-`, escapePS(message), escapePS(title))
-	psRun(script) //nolint:errcheck
+	windows.MessageBox(0, nativeString(message), nativeString(title), 0x00000040|0x00010000)
 }
 
-// OpenFile opens a file in Notepad.
-func OpenFile(path string) {
-	exec.Command("notepad.exe", path).Start()
-}
-
-// escapePS escapes a string for embedding inside single quotes in PowerShell.
-func escapePS(s string) string {
-	// Single quotes are escaped by doubling them in PowerShell
-	s = strings.ReplaceAll(s, "'", "''")
-	// Newlines: break out of the string literal and concat
-	s = strings.ReplaceAll(s, "\n", "' + \"`n\" + '")
-	return s
-}
+func OpenFile(path string) { exec.Command("notepad.exe", path).Start() }

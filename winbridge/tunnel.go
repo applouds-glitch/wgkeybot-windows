@@ -44,6 +44,7 @@ type Manager struct {
 	socksPort int
 	physGW    string        // physical gateway at connect time, for detecting network changes
 	wgLUID    winipcfg.LUID // wintun adapter LUID (VPN mode), for route cleanup on disconnect
+	netWatch  *NetworkWatcher
 	connected bool
 }
 
@@ -115,10 +116,18 @@ func (m *Manager) Connect(ctx context.Context) error {
 		}
 		routeMgr = rm
 		m.routeMgr = rm
-		if gw, _, err := DefaultGateway(); err == nil {
-			m.physGW = gw
-		}
 	}
+
+	// 1b. Физический шлюз — точка отсчёта для детекта смены сети (в обоих
+	//     режимах) и первый ответ на вопрос «есть ли сеть вообще»: без шлюза
+	//     воркеры прокси ждут у гейта (proxy.SetNetworkAvailable), а не жгут
+	//     креды и Allocate-квоту впустую. Дальше флаг ведёт CheckNetworkChange.
+	if gw, _, err := DefaultGateway(); err == nil {
+		m.physGW = gw
+	} else {
+		m.physGW = ""
+	}
+	proxy.SetNetworkAvailable(m.physGW != "")
 
 	// 2. Определяем DNS — сначала пробуем системный, иначе встроенный.
 	sysDNS := GetSystemDNS()
@@ -180,6 +189,8 @@ func (m *Manager) Connect(ctx context.Context) error {
 			return fmt.Errorf("VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»")
 		case proxy.ReadyStatusCallUnavailable:
 			return fmt.Errorf("VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг")
+		case proxy.ReadyStatusTurnFatal:
+			return fmt.Errorf("TURN недоступен: %s — попробуйте позже или обновите конфиг", t.TurnFatalReason())
 		default:
 			return fmt.Errorf("TURN proxy failed (status %d)", status)
 		}
@@ -267,6 +278,15 @@ func (m *Manager) Connect(ctx context.Context) error {
 		}
 	}
 
+	// 13. Событийный детект смены сети (см. NetworkWatcher); опрос из tray
+	//     остаётся страховкой. Неудача регистрации не фатальна — останется
+	//     только опрос.
+	if w, err := WatchNetwork(func() { m.CheckNetworkChange() }); err == nil {
+		m.netWatch = w
+	} else {
+		log.Printf("[Manager] Warning: network change notifications unavailable: %v", err)
+	}
+
 	m.connected = true
 	connected = true // disarm cleanup defer
 	log.Printf("[Manager] Tunnel %q connected", cfg.Name)
@@ -283,6 +303,13 @@ func (m *Manager) Disconnect() {
 	}
 
 	cfg := m.cfg
+
+	// Снимаем подписку на изменения сети до остановки туннеля: её колбэк
+	// зовёт CheckNetworkChange, которому нужен живой m.tunnel.
+	if m.netWatch != nil {
+		m.netWatch.Close()
+		m.netWatch = nil
+	}
 
 	// Останавливаем SOCKS5-сервер (если был в SOCKS-режиме).
 	if m.socks != nil {
@@ -355,6 +382,20 @@ func (m *Manager) PendingCaptchaURL() string {
 	return t.PendingCaptchaURL()
 }
 
+// TurnFatalReason возвращает причину, по которой все воркеры TURN-прокси
+// сдались, или "" пока у туннеля есть транспорт. Читает m.tunnel под мьютексом
+// так же, как PendingCaptchaURL: watchdog опрашивает её из своей горутины, а
+// Disconnect обнуляет поле.
+func (m *Manager) TurnFatalReason() string {
+	m.mu.Lock()
+	t := m.tunnel
+	m.mu.Unlock()
+	if t == nil {
+		return ""
+	}
+	return t.TurnFatalReason()
+}
+
 // SolveCaptcha delivers a captcha answer to a blocked WorkerGroup.
 // Safe to call when there is no pending captcha (no-op).
 func (m *Manager) SolveCaptcha(answer string) {
@@ -366,28 +407,44 @@ func (m *Manager) SolveCaptcha(answer string) {
 	}
 }
 
-// CheckNetworkChange polls the current default gateway and, if it differs
-// from the one recorded during Connect, notifies the tunnel so it can reset
-// DNS caches and reconnect TURN streams.
+// CheckNetworkChange сверяет текущий физический дефолтный шлюз с записанным
+// и делает две вещи. Во-первых, сообщает прокси, есть ли сеть вообще: без
+// шлюза воркеры ждут у гейта вместо того, чтобы жечь креды и Allocate-квоту
+// (proxy.SetNetworkAvailable, переходы логируются там). Во-вторых, если шлюз
+// сменился — уведомляет туннель: сброс DNS-кеша и доказательства пути, потоки
+// переподключаются по мере отвала. Возвращает true, если сеть сменилась.
+//
+// Зовётся из опроса tray раз в 5 с и из NetworkWatcher по событию; оба пути
+// идемпотентны, повторный вызов без изменений ничего не делает.
 func (m *Manager) CheckNetworkChange() bool {
 	m.mu.Lock()
 	t := m.tunnel
 	prevGW := m.physGW
 	m.mu.Unlock()
 
-	if t == nil || prevGW == "" {
+	if t == nil {
 		return false
 	}
 
 	gw, _, err := DefaultGateway()
-	if err != nil || gw == "" || gw == prevGW {
+	online := err == nil && gw != ""
+	proxy.SetNetworkAvailable(online)
+	if !online || gw == prevGW {
+		return false
+	}
+
+	m.mu.Lock()
+	m.physGW = gw
+	m.mu.Unlock()
+	if prevGW == "" {
+		// Шлюза при подключении не было (Connect без сети или SOCKS-режим
+		// на отвалившемся аплинке) — это не смена сети, а её появление;
+		// доказательство пути сбрасывать нечего.
+		log.Printf("[Manager] Gateway appeared: %s", gw)
 		return false
 	}
 
 	log.Printf("[Manager] Gateway changed: %s -> %s", prevGW, gw)
-	m.mu.Lock()
-	m.physGW = gw
-	m.mu.Unlock()
 	t.OnNetworkChange()
 	return true
 }
@@ -420,9 +477,11 @@ func sanitizeIfaceName(name string) string {
 
 // StartWatchdog запускает фоновую горутину, которая следит за состоянием WG
 // handshake. Если handshake устарел (>3 мин) при растущем TX — соединение
-// считается мёртвым, и вызывается onDead. Горутина завершается при отмене ctx
+// считается мёртвым, и вызывается onDead. Если же TURN-прокси сообщил, что все
+// воркеры сдались, вызывается onFatal: это диагноз, а не симптом, и
+// переподключение уехало бы в ту же стену. Горутина завершается при отмене ctx
 // или если туннель уже отключён.
-func (m *Manager) StartWatchdog(ctx context.Context, onDead func()) {
+func (m *Manager) StartWatchdog(ctx context.Context, onDead func(), onFatal func(reason string)) {
 	const (
 		pollInterval  = 30 * time.Second
 		staleAfter    = 3 * time.Minute
@@ -444,6 +503,17 @@ func (m *Manager) StartWatchdog(ctx context.Context, onDead func()) {
 			}
 			stats := m.Stats()
 			if !stats.Connected {
+				return
+			}
+			// Фатальный отказ TURN проверяется первым: мёртвый handshake — только
+			// симптом, и наступает он позже. Сброс счётчиков по висящей капче ниже
+			// этой проверки не касается: до фатального состояния доходят лишь
+			// когда лестницы решения уже кончились, то есть капчи на экране нет.
+			if reason := m.TurnFatalReason(); reason != "" {
+				log.Printf("[Watchdog] TURN fatal: %s — останавливаемся без реконнекта", reason)
+				if onFatal != nil {
+					onFatal(reason)
+				}
 				return
 			}
 			// Пока висит капча, TURN-прокси заблокирован в ожидании ответа

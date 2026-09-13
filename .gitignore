@@ -15,6 +15,7 @@
 # Claude Code
 .claude/
 CLAUDE.md
+.codegraph/
 
 # OS
 .DS_Store
@@ -23,3 +24,7 @@ Thumbs.db
 # Runtime
 wgkeybot.log
 *.conf
+
+# Superpowers specs (внутренние заметки)
+docs/superpowers/
+.superpowers/

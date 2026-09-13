@@ -15,8 +15,8 @@ import (
 // info/VK_TLS_TRUST_ANCHORS.md). Mirrors what the VK app does in its own
 // KeyStore: it ADDS its trust anchors on top of the system CAs rather than
 // replacing them. We bundle the same set VK carries — the Минцифры ("Russian
-// Trusted") chain plus VK's self-signed CA — so TLS to api.vk.me / api.vk.com /
-// login.vk.com / id.vk.com / calls.okcdn.ru keeps working if VK/OK migrate off
+// Trusted") chain plus VK's self-signed CA — so TLS to internal.api.vk.ru /
+// api.vk.ru / login.vk.ru / id.vk.ru / calls.okcdn.ru keeps working if VK/OK migrate off
 // the public CAs (GTS/HARICA) they use today onto those roots; global
 // Android/Windows devices don't carry them in their system store.
 //

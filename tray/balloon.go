@@ -89,9 +89,19 @@ func systrayHWnd() windows.Handle {
 }
 
 func copyStr16(dst []uint16, s string) {
+	if len(dst) == 0 {
+		return
+	}
 	src := windows.StringToUTF16(s)
 	n := copy(dst, src)
 	if n < len(dst) {
 		dst[n] = 0
 	}
+	// windows.StringToUTF16 always NUL-terminates src, but copy() truncates
+	// silently when s doesn't fit — n == len(dst) then, and that terminator
+	// (one past what copy took) never lands in dst. Harmless today because
+	// SzInfo/SzInfoTitle are followed by fields Notify leaves zero, but that is
+	// happenstance, not a guarantee — force the last element to zero so dst is
+	// always a terminated string on its own.
+	dst[len(dst)-1] = 0
 }

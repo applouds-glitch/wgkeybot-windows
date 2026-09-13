@@ -46,7 +46,12 @@ func RequestCaptchaCtx(ctx context.Context, redirectURI string, timeout time.Dur
 
 	captchaMu.Lock()
 	if captchaAnswerCh != nil {
-		// Уже есть pending captcha — отбрасываем старую (вряд ли актуальна).
+		// Уже есть pending captcha. С requestCaptchaSerialized (vk.go) этот путь
+		// недостижим — решение капчи сериализовано выше по стеку, — но если он
+		// когда-нибудь оживёт, вытесненный вызывающий получает "" и не может
+		// отличить это от «пользователь не решил». Логируем, чтобы такой ложный
+		// отказ не пришлось искать по косвенным признакам.
+		turnLog("[Captcha] Pending request for %s evicted by a newer one (%s)", captchaPending, redirectURI)
 		close(captchaAnswerCh)
 	}
 	captchaPending = redirectURI
@@ -101,15 +106,21 @@ func PendingCaptchaURL() string {
 
 // PublishCaptchaAnswer доставляет ответ ожидающей RequestCaptcha goroutine.
 // Безопасно вызывать когда нет pending captcha (no-op).
+//
+// Отправка — строго под captchaMu: close() чужого канала в RequestCaptchaCtx
+// тоже происходит под captchaMu и атомарно заменяет captchaAnswerCh на свежий
+// канал, поэтому сериализованный sender закрытый канал увидеть не может.
+// Отправка вне mutex здесь была гонкой send-on-closed-channel (panic).
+// Канал буферизован (cap 1) и send идёт через select/default — под mutex
+// не блокируемся.
 func PublishCaptchaAnswer(answer string) {
 	captchaMu.Lock()
-	ch := captchaAnswerCh
-	captchaMu.Unlock()
-	if ch == nil {
+	defer captchaMu.Unlock()
+	if captchaAnswerCh == nil {
 		return
 	}
 	select {
-	case ch <- answer:
+	case captchaAnswerCh <- answer:
 		turnLog("[Captcha] Answer published (%d bytes)", len(answer))
 	default:
 		// Канал уже принял ответ — дубликат, игнорируем.

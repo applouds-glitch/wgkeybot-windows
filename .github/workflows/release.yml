@@ -34,6 +34,9 @@ jobs:
       - name: Install goversioninfo
         run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
 
+      - name: Regenerate application icons
+        run: go run ./cmd/genico
+
       - name: Derive version from tag
         id: ver
         run: |

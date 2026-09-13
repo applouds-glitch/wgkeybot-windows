@@ -29,6 +29,10 @@ const (
 	// недействительна. Terminal: ни captcha, ни ретраи не помогут — нужна
 	// новая ссылка (новый конфиг).
 	ReadyStatusCallUnavailable ReadyStatus = 3
+	// ReadyStatusTurnFatal — все воркеры сессии сдались: капча не решается
+	// столько раз подряд, что дальше пробовать бессмысленно, либо звонок умер
+	// уже после старта. Terminal: watchdog не должен переподключаться.
+	ReadyStatusTurnFatal ReadyStatus = 4
 )
 
 // Config — параметры TURN-прокси + WireGuard для Windows-клиента.
@@ -96,9 +100,10 @@ type Tunnel struct {
 	bootCancel context.CancelFunc
 	bootResult int32
 
-	device   *device.Device
-	tunDev   tun.Device
-	stopOnce sync.Once
+	device      *device.Device
+	tunDev      tun.Device
+	wgKeepalive *wireGuardKeepaliveSender
+	stopOnce    sync.Once
 }
 
 // NewTunnel создаёт Tunnel из Config. Не делает сетевых вызовов.
@@ -180,6 +185,9 @@ func (t *Tunnel) WaitReady(timeout time.Duration) ReadyStatus {
 		return ReadyStatusCaptchaRequired
 	case <-time.After(timeout):
 		return ReadyStatusError
+	}
+	if reason := turnFatalReason(); reason != "" {
+		return ReadyStatusTurnFatal
 	}
 	if PendingCaptchaURL() != "" {
 		return ReadyStatusCaptchaRequired
@@ -276,9 +284,15 @@ func (t *Tunnel) startDevice(tunDev tun.Device, uapiConfig string) error {
 		return fmt.Errorf("device.Up: %w", err)
 	}
 
+	// WireGuard's own keepalive rides the TURN keepalive grid (see
+	// wireguard_keepalive.go) so both layers share one wake, and so the first
+	// grid tick kicks the initial handshake instead of waiting for traffic.
+	sender := installWireGuardKeepaliveSender(newWireGuardKeepaliveSendFunc(dev, uapiConfig))
+
 	t.mu.Lock()
 	t.device = dev
 	t.tunDev = tunDev
+	t.wgKeepalive = sender
 	t.mu.Unlock()
 	return nil
 }
@@ -311,13 +325,18 @@ func (t *Tunnel) Stop() {
 		t.mu.Lock()
 		cancel := t.bootCancel
 		dev := t.device
+		sender := t.wgKeepalive
 		t.device = nil
+		t.wgKeepalive = nil
 		t.mu.Unlock()
 
 		if cancel != nil {
 			cancel()
 		}
 		StopProxy()
+		// Blocks until an already-started send returns, so the device is never
+		// closed underneath one.
+		clearWireGuardKeepaliveSender(sender)
 		if dev != nil {
 			dev.Close()
 		}
@@ -330,6 +349,11 @@ func (t *Tunnel) ListenAddr() string { return t.cfg.ListenAddr }
 
 // PendingCaptchaURL — URL slider-captcha если PoW не сработал. Иначе "".
 func (t *Tunnel) PendingCaptchaURL() string { return PendingCaptchaURL() }
+
+// TurnFatalReason возвращает причину, по которой все воркеры сессии сдались,
+// или "" пока у туннеля есть транспорт. Опрашивается winbridge в двух точках:
+// в цикле WaitReady на подключении и в тике watchdog'а уже после него.
+func (t *Tunnel) TurnFatalReason() string { return turnFatalReason() }
 
 // SolveCaptcha — передаёт ответ captcha ожидающей Go-горутине.
 func (t *Tunnel) SolveCaptcha(answer string) { PublishCaptchaAnswer(answer) }

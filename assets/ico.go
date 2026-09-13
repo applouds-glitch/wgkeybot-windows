@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
+	"image/color"
 	"image/png"
 	"sort"
 )
 
 // EncodeICO packs one or more RGBA frames into a single multi-size Windows .ico
-// file. Frames ≤ 64px are stored as classic BMP (BITMAPINFOHEADER + BGRA + AND
+// file. Frames < 256px are stored as classic BMP (BITMAPINFOHEADER + BGRA + AND
 // mask); 256px frames are stored PNG-compressed, as Windows expects.
 //
 // A multi-size .ico lets Windows pick the best frame for each context (16px in
@@ -66,28 +67,30 @@ func EncodeICO(frames []*image.RGBA) []byte {
 }
 
 // toICOResource encodes an *image.RGBA into the in-.ico BMP form used for frames
-// up to 64px: BITMAPINFOHEADER + 32-bit BGRA XOR mask (bottom-up) + 1-bit AND
-// mask. The AND mask is left all-zero; transparency comes from the BGRA alpha.
+// below 256px: BITMAPINFOHEADER + straight-alpha BGRA (bottom-up) + 1-bit AND
+// mask. Fully transparent pixels are also marked in the legacy AND mask.
 func toICOResource(img *image.RGBA) []byte {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 
 	xorData := make([]byte, w*h*4)
+	andStride := ((w + 31) / 32) * 4
+	andData := make([]byte, andStride*h)
 	for y := 0; y < h; y++ {
 		srcY := b.Min.Y + (h - 1 - y) // bottom-up rows
 		for x := 0; x < w; x++ {
-			c := img.RGBAAt(b.Min.X+x, srcY)
+			// Go's RGBA is premultiplied; ICO/DIB stores straight-alpha BGRA.
+			c := color.NRGBAModel.Convert(img.At(b.Min.X+x, srcY)).(color.NRGBA)
 			i := (y*w + x) * 4
 			xorData[i+0] = c.B
 			xorData[i+1] = c.G
 			xorData[i+2] = c.R
 			xorData[i+3] = c.A
+			if c.A == 0 {
+				andData[y*andStride+x/8] |= 0x80 >> uint(x%8)
+			}
 		}
 	}
-
-	// AND mask: 1 bit/pixel, rows padded to a DWORD boundary, all zero.
-	andStride := ((w + 31) / 32) * 4
-	andData := make([]byte, andStride*h)
 
 	var buf bytes.Buffer
 	var hdr [40]byte

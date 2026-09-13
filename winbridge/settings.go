@@ -3,6 +3,7 @@ package winbridge
 import (
 	"encoding/json"
 	"os"
+	"time"
 )
 
 // Mode определяет, как поднимать туннель: полноценный VPN или локальный SOCKS-прокси.
@@ -27,6 +28,17 @@ type AppSettings struct {
 	Mode Mode `json:"mode"`
 	// SocksPort — порт локального SOCKS5-сервера в режиме socks.
 	SocksPort int `json:"socks_port"`
+	// AutoRefreshDisabled выключает фоновое обновление конфига (tray ходит за
+	// ним раз в 12 часов через поднятый туннель). По умолчанию обновление
+	// включено, поэтому хранится инверсия: нулевое значение в старом
+	// settings.json означает «включено», а не «выключено».
+	AutoRefreshDisabled bool `json:"auto_refresh_disabled,omitempty"`
+	// LastRefresh — время последнего успешного запроса конфига у control plane,
+	// ручного или фонового. От него отсчитывается следующее фоновое.
+	LastRefresh time.Time `json:"last_refresh"`
+	// LastConfigHash — SHA-256 последнего сохранённого конфига. Обновление,
+	// принёсшее тот же конфиг, ничего не пересохраняет и не переподключает.
+	LastConfigHash string `json:"last_config_hash,omitempty"`
 }
 
 // normalize проставляет дефолты для отсутствующих/некорректных полей.

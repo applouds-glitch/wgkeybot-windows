@@ -3,6 +3,7 @@ package winbridge
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -134,6 +135,10 @@ func parseConfBytes(data []byte, path string) (*TunnelConfig, error) {
 
 // parseTURNSettings заполняет proxy.Config из списка #@wgt: строк.
 func parseTURNSettings(lines []string, t *proxy.Config) {
+	// UDP — единственный транспорт до релеев в проде; TCP-ветка dialAndAllocate
+	// осталась от апстрима. Конфиг без строки #@wgt:UseUDP должен подниматься по
+	// UDP, а не проваливаться в нулевое значение false.
+	t.UseUDP = true
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "#@wgt:") {
 			continue
@@ -353,6 +358,14 @@ func FetchConfig(accessToken string) ([]byte, error) {
 		return nil, fmt.Errorf("сервер вернул пустой config")
 	}
 	return []byte(strings.TrimSpace(result.Config)), nil
+}
+
+// ConfigHash — SHA-256 конфига в hex. По нему tray решает, изменился ли
+// конфиг с последнего сохранения: control plane отдаёт его целиком при каждом
+// запросе, а рвать туннель ради того же самого конфига незачем.
+func ConfigHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // DefaultConfigDir возвращает директорию хранения конфигов.

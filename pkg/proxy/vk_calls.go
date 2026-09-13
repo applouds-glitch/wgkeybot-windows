@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	neturl "net/url"
 	"strings"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
@@ -23,9 +25,9 @@ import (
 
 // VK Calls anonymous flow — the captcha-free path to TURN credentials.
 //
-// Unlike the legacy chain (login.vk.com get_anonym_token → calls.getAnonymousToken
-// on api.vk.com v5.282, which is captcha-gated with error_code 14), this flow
-// uses the VK Connect app id on api.vk.me with the messages.* endpoints, which
+// Unlike the legacy chain (login.vk.ru get_anonym_token → calls.getAnonymousToken
+// on api.vk.ru v5.282, which is captcha-gated with error_code 14), this flow uses
+// the VK Connect app id on internal.api.vk.ru with the messages.* endpoints, which
 // mint an OK anonym call token WITHOUT a captcha. The final OK CDN join
 // (auth.anonymLogin + vchat.joinConversationByLink on calls.okcdn.ru) is the
 // same handshake the legacy path already performs.
@@ -35,7 +37,7 @@ import (
 // turn_server lifetime parsing.
 const (
 	vkConnectClientID     = "8093730"
-	vkCallsAPIHost        = "api.vk.me"
+	vkCallsAPIHost        = "internal.api.vk.ru"
 	vkCallsAnonAPIVersion = "5.276"
 	vkCallsOKHost         = "https://calls.okcdn.ru/fb.do"
 	vkCallsOKAppKey       = "CGMMEJLGDIHBABABA"
@@ -56,7 +58,49 @@ func callUnavailablef(format string, a ...interface{}) error {
 
 func isCallUnavailable(err error) bool { return errors.Is(err, errCallUnavailable) }
 
-// isFatalVKCallCode reports whether a VK api.vk.me error_code means the call is
+// errVKCallsTransient marks a failure that says nothing about the request and is
+// worth simply repeating: VK's own "come back later" codes, an HTTP 5xx, or a
+// request that never produced a parsable answer.
+//
+// It exists because failing this flow is not free. The caller falls through to
+// the legacy chain, and that is where the captcha lives — so one hiccup at VK
+// used to cost the user a full-screen captcha dialog for a call that would have
+// gone through a second later.
+var errVKCallsTransient = errors.New("transient VK Calls failure")
+
+func transientVKCallsf(format string, a ...interface{}) error {
+	return fmt.Errorf("%w: "+format, append([]interface{}{errVKCallsTransient}, a...)...)
+}
+
+func isTransientVKCalls(err error) bool { return errors.Is(err, errVKCallsTransient) }
+
+// isRetryableVKCode reports whether a VK error_code is VK asking us to come back
+// rather than a verdict on the request: 1 (unknown error), 6 (too many requests
+// per second) and 10 (internal server error) are all documented as "try again".
+// Notably absent is 14: a captcha gate is a verdict, and the legacy chain — not
+// a retry — is what can answer it.
+func isRetryableVKCode(code int) bool {
+	switch code {
+	case 1, 6, 10:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	// vkCallsAttempts bounds how many times the whole flow runs before the caller
+	// falls through to the legacy captcha chain. Three attempts cost at most ~2s
+	// of extra requests; the captcha they avoid costs a dialog and six seconds of
+	// the user's attention, so the trade is lopsided in favour of retrying.
+	vkCallsAttempts = 3
+	// vkCallsRetryDelay is the per-attempt backoff step, jittered below. Kept
+	// short because the flow itself takes under a second and the whole point is
+	// to beat the captcha detour rather than to wait out a real outage.
+	vkCallsRetryDelay = 400 * time.Millisecond
+)
+
+// isFatalVKCallCode reports whether a VK API error_code means the call is
 // permanently unreachable. Ported from amurcanov/proxy-turn-vk-android@d95b65b5:
 // 951 (call not found) and 954 (invalid/expired join link) on the messages.*
 // endpoints. The legacy calls.getAnonymousToken 9xxx call domain is classified
@@ -70,14 +114,56 @@ func isFatalVKCallCode(code int) bool {
 	}
 }
 
-// getVKCredsViaVKCalls runs the 5-step VK Calls anonymous flow and returns
-// (username, password, resolvedTurnAddrs, lifetimeSecs, error). It reuses the
-// caller's TLS client so requests still go over wgProtectSocket-bound sockets.
+// getVKCredsViaVKCalls returns (username, password, resolvedTurnAddrs,
+// lifetimeSecs, error) from the VK Calls anonymous flow, repeating the whole
+// flow while VK answers with something transient.
+//
+// The retry is deliberately of the whole flow rather than the failing step: each
+// attempt is a fresh anonymous device with its own token chain, so a step that
+// failed is not resumed under an identity VK has already refused. Steps 1-2 are
+// two extra cheap requests, which is the entire cost.
 func getVKCredsViaVKCalls(ctx context.Context, link string, client tlsclient.HttpClient, profile Profile) (string, string, []string, int, error) {
+	var lastErr error
+	for attempt := 1; attempt <= vkCallsAttempts; attempt++ {
+		user, pass, addrs, lifetime, err := vkCallsAttempt(ctx, link, client, profile)
+		if err == nil {
+			return user, pass, addrs, lifetime, nil
+		}
+		lastErr = err
+		// A cancelled context is our own teardown, and a non-transient error is a
+		// verdict — captcha gate, dead call, malformed link. Neither is worth a
+		// second identical trip to VK.
+		if ctx.Err() != nil || !isTransientVKCalls(err) || attempt == vkCallsAttempts {
+			break
+		}
+		delay := time.Duration(attempt)*vkCallsRetryDelay + time.Duration(rand.Intn(300))*time.Millisecond
+		turnLog("[VKCalls] attempt %d/%d failed (%v) — retrying in %v", attempt, vkCallsAttempts, err, delay.Round(time.Millisecond))
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", "", nil, 0, ctx.Err()
+		}
+	}
+	return "", "", nil, 0, lastErr
+}
+
+// vkCallsAttempt runs the 5-step VK Calls anonymous flow once. It reuses the
+// caller's TLS client rather than building a fresh one per attempt: the client
+// only carries transport-level state — TLS/JA3 fingerprint, cookie jar,
+// DNS-cache-backed dialer, root CA pool — none of which VK treats as part of
+// the anonymous device's identity, so rebuilding it on every retry would add
+// cost without buying anything.
+//
+// device_id is freshly generated per attempt, deliberately. Sourcing it from a
+// persisted identity instead made every credential group present the SAME
+// anonymous device, and groups fetch concurrently (vkSemaphore admits two) into
+// the same call: two identical devices racing one messages.getAnonymCallToken,
+// which VK answers with error_code 10.
+func vkCallsAttempt(ctx context.Context, link string, client tlsclient.HttpClient, profile Profile) (string, string, []string, int, error) {
 	deviceID := uuid.New().String()
 	name := generateName()
 	nameEnc := neturl.QueryEscape(name)
-	linkURL := neturl.QueryEscape("https://vk.com/call/join/" + link)
+	linkURL := neturl.QueryEscape("https://vk.ru/call/join/" + link)
 
 	doRequest := func(step, url string) (map[string]interface{}, error) {
 		req, err := fhttp.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(nil))
@@ -90,17 +176,24 @@ func getVKCredsViaVKCalls(ctx context.Context, link string, client tlsclient.Htt
 
 		httpResp, err := client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("%s: request failed: %w", step, err)
+			return nil, transientVKCallsf("%s: request failed: %w", step, err)
 		}
 		defer func() { _ = httpResp.Body.Close() }()
 
+		// A 5xx is VK having a bad moment, not a verdict on this request.
+		if httpResp.StatusCode >= 500 {
+			return nil, transientVKCallsf("%s: HTTP %d", step, httpResp.StatusCode)
+		}
+
 		body, err := io.ReadAll(httpResp.Body)
 		if err != nil {
-			return nil, fmt.Errorf("%s: read response: %w", step, err)
+			return nil, transientVKCallsf("%s: read response: %w", step, err)
 		}
 		var resp map[string]interface{}
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("%s: unmarshal JSON: %w", step, err)
+			// Not JSON at all: a truncated body, or an interstitial from something
+			// between us and VK. Either way the next attempt may well get an answer.
+			return nil, transientVKCallsf("%s: unmarshal JSON: %w", step, err)
 		}
 		return resp, nil
 	}
@@ -113,6 +206,9 @@ func getVKCredsViaVKCalls(ctx context.Context, link string, client tlsclient.Htt
 	resp1, err := doRequest("step1 auth.getAnonymToken", step1URL)
 	if err != nil {
 		return "", "", nil, 0, err
+	}
+	if apiErr := vkCallsAPIError("step1 auth.getAnonymToken", resp1); apiErr != nil {
+		return "", "", nil, 0, apiErr
 	}
 	anonymToken, err := extractVKCallsStr(resp1, "response", "token")
 	if err != nil {
@@ -250,7 +346,7 @@ func parseVKCallsTurnServer(ctx context.Context, resp map[string]interface{}) (s
 	return username, credential, addresses, lifetimeSecs, nil
 }
 
-// vkCallsAPIError reports a VK API ("api.vk.me") error. error_code 14 is the
+// vkCallsAPIError reports a VK API (vkCallsAPIHost) error. error_code 14 is the
 // captcha gate — surfaced distinctly so the log makes clear the captcha-free
 // flow hit a captcha and the caller is falling back to the legacy path.
 func vkCallsAPIError(step string, resp map[string]interface{}) error {
@@ -268,6 +364,9 @@ func vkCallsAPIError(step string, resp map[string]interface{}) error {
 	}
 	if int(code) == 14 {
 		return fmt.Errorf("%s: VK captcha gate (error_code 14): %s", step, msg)
+	}
+	if isRetryableVKCode(int(code)) {
+		return transientVKCallsf("%s: VK API error_code=%d: %s", step, int(code), msg)
 	}
 	return fmt.Errorf("%s: VK API error_code=%d: %s", step, int(code), msg)
 }
