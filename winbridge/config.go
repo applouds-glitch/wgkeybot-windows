@@ -20,6 +20,14 @@ import (
 	"github.com/wgkeybot/windows/pkg/proxy"
 )
 
+// defaultTURNMTU — MTU туннеля поверх TURN, когда конфиг его не называет; MTU из
+// конфига берётся как есть (бот выдаёт 1280). Каждый внутренний пакет уходит
+// завёрнутым в WireGuard (+32 Б), WRAP (+14 Б, а сервер добивает downlink ещё
+// до 32 Б), TURN ChannelData (+4 Б) и UDP/IPv4 (+28 Б): при 1280 это до ~1390 Б
+// на проводе, при 1200 — до ~1310. Значение то же, что у Android-клиента
+// (TurnConfigProcessor.TURN_DEFAULT_MTU).
+const defaultTURNMTU = 1200
+
 // TunnelConfig — полная конфигурация тоннеля, прочитанная из .conf-файла.
 type TunnelConfig struct {
 	// Стандартный WireGuard [Interface]
@@ -54,7 +62,7 @@ func ParseConfFile(path string) (*TunnelConfig, error) {
 // parseConfBytes парсит WireGuard конфиг из байтов.
 // path используется только для извлечения имени тоннеля.
 func parseConfBytes(data []byte, path string) (*TunnelConfig, error) {
-	cfg := &TunnelConfig{MTU: 1280}
+	cfg := &TunnelConfig{MTU: defaultTURNMTU}
 
 	// Имя тоннеля = имя файла без расширения
 	base := path

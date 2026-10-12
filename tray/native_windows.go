@@ -169,7 +169,10 @@ func newNativeWindow(title string, width, height int, owner uintptr) (*nativeWin
 	if nativeRegisterErr != nil {
 		return nil, nativeRegisterErr
 	}
-	const style = 0x00c80000 | 0x00020000 | 0x02000000 // caption, system menu, minimize, clip children
+	// No WS_CLIPCHILDREN: a group box paints only its frame and caption and leaves
+	// the interior to the parent's erase. Clipping children out of that erase
+	// leaves the gaps inside every group box unpainted (black or stale pixels).
+	const style = 0x00c80000 | 0x00020000 // caption, system menu, minimize
 	hwnd, _, err := pCreateWindow.Call(0, uintptr(unsafe.Pointer(nativeString(nativeClass))), uintptr(unsafe.Pointer(nativeString(title))),
 		style, 0x80000000, 0x80000000, uintptr(width), uintptr(height), owner, 0, instance, 0)
 	if hwnd == 0 {

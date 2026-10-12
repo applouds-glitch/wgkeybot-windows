@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	neturl "net/url"
 	"sync"
 	"time"
 )
@@ -27,6 +28,17 @@ var (
 	captchaNotifyCh = make(chan struct{}, 1)
 )
 
+// CaptchaURLForLog — адрес капчи без query и fragment: в query VK кладёт
+// session_token, а лог пользователи присылают в поддержку. Схемы, хоста и пути
+// достаточно, чтобы отличить одну страницу капчи от другой.
+func CaptchaURLForLog(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<captcha URL>"
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
 // CaptchaNotifyChan returns the channel that fires when a captcha is pending.
 // Used by WaitReady to detect captcha state before StartProxy returns.
 func CaptchaNotifyChan() <-chan struct{} { return captchaNotifyCh }
@@ -51,7 +63,7 @@ func RequestCaptchaCtx(ctx context.Context, redirectURI string, timeout time.Dur
 		// когда-нибудь оживёт, вытесненный вызывающий получает "" и не может
 		// отличить это от «пользователь не решил». Логируем, чтобы такой ложный
 		// отказ не пришлось искать по косвенным признакам.
-		turnLog("[Captcha] Pending request for %s evicted by a newer one (%s)", captchaPending, redirectURI)
+		turnLog("[Captcha] Pending request for %s evicted by a newer one (%s)", CaptchaURLForLog(captchaPending), CaptchaURLForLog(redirectURI))
 		close(captchaAnswerCh)
 	}
 	captchaPending = redirectURI
@@ -73,7 +85,7 @@ func RequestCaptchaCtx(ctx context.Context, redirectURI string, timeout time.Dur
 		captchaMu.Unlock()
 	}()
 
-	turnLog("[Captcha] Requesting host solve: %s", redirectURI)
+	turnLog("[Captcha] Requesting host solve: %s", CaptchaURLForLog(redirectURI))
 
 	// timeout <= 0 → ждём бессрочно (только ответ или отмена ctx).
 	var timeoutCh <-chan time.Time

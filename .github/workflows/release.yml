@@ -78,7 +78,7 @@ jobs:
           CGO_ENABLED: "0"
         run: >
           go build -trimpath
-          -ldflags="-s -w -H windowsgui -X github.com/wgkeybot/windows/tray.Version=${{ steps.ver.outputs.version }}"
+          -ldflags="-s -w -H windowsgui -X github.com/wgkeybot/windows/tray.Version=${{ steps.ver.outputs.version }} -X github.com/wgkeybot/windows/pkg/release.DefaultRepo=${{ github.repository }}"
           -o wgkeybot.exe .
 
       # NOTE: builds ship UNSIGNED on purpose. A self-signed Authenticode

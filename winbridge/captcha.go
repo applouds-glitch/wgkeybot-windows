@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/wgkeybot/windows/pkg/proxy"
 )
 
 // SolveCaptchaProxy starts a local HTTP reverse proxy that serves the VK captcha
@@ -56,7 +58,13 @@ func SolveCaptchaProxy(ctx context.Context, redirectURI string) (string, error) 
 		}
 	}
 
+	// Дозвон мимо туннеля (proxy.DialOutsideTunnel): страница капчи и всё, что
+	// она подгружает, идут по физической сети — через закалённый резолвер прокси
+	// и с bypass-маршрутом на каждый адрес. Системный резолвер и маршруты здесь
+	// не годятся: капчу решают и под поднятым VPN (ре-фетч кредов), и при
+	// перезапуске транспорта, когда туннель как раз мёртв.
 	transport := &http.Transport{
+		DialContext:         proxy.DialOutsideTunnel,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,

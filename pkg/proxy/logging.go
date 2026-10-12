@@ -10,9 +10,14 @@ import (
 // Logging: SetLogFilePath перенаправляет вывод в файл; без пути — stderr.
 
 var (
-	logMu       sync.Mutex
-	logFile     *os.File
-	logTZOffset int
+	logMu   sync.Mutex
+	logFile *os.File
+	// logLoc — часовой пояс меток времени. По умолчанию локальный: тем же
+	// поясом стандартный log пишет строки winbridge и tray в тот же файл, и
+	// раньше строки прокси шли в UTC вперемешку с ними — на машине в MSK три
+	// часа разницы внутри одного лога. SetTimezoneOffset — для хоста, у которого
+	// time.Local не настоящий (так было заведено для Android).
+	logLoc = time.Local
 )
 
 func SetLogFilePath(path string) {
@@ -34,14 +39,22 @@ func SetLogFilePath(path string) {
 
 func SetTimezoneOffset(offsetSeconds int) {
 	logMu.Lock()
-	logTZOffset = offsetSeconds
+	logLoc = time.FixedZone("", offsetSeconds)
 	logMu.Unlock()
+}
+
+// logClock переводит t в часовой пояс лога — для времени, которое печатается в
+// теле сообщения, чтобы оно не расходилось с меткой строки.
+func logClock(t time.Time) time.Time {
+	logMu.Lock()
+	defer logMu.Unlock()
+	return t.In(logLoc)
 }
 
 func logf(format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
-	ts := time.Now().UTC().Add(time.Duration(logTZOffset) * time.Second).Format("15:04:05.000")
+	ts := time.Now().In(logLoc).Format("15:04:05.000")
 	line := fmt.Sprintf("[%s] %s\n", ts, fmt.Sprintf(format, args...))
 	if logFile != nil {
 		_, _ = logFile.WriteString(line)

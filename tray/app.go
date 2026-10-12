@@ -54,6 +54,7 @@ type App struct {
 	mModeVPN    *systray.MenuItem
 	mModeSOCKS  *systray.MenuItem
 	mLog        *systray.MenuItem // nil when not in debug mode
+	mCheckUpd   *systray.MenuItem
 	mAbout      *systray.MenuItem
 	mQuit       *systray.MenuItem
 
@@ -67,6 +68,8 @@ type App struct {
 	// каждые 5 секунд опроса статуса.
 	refreshing      atomic.Bool
 	nextAutoRefresh atomic.Int64
+	// checkingUpdate — идёт проверка версии на GitHub (update_windows.go).
+	checkingUpdate atomic.Bool
 }
 
 const (
@@ -121,6 +124,7 @@ func (a *App) OnReady() {
 		a.settings.Mode == winbridge.ModeSOCKS,
 	)
 	systray.AddSeparator()
+	a.mCheckUpd = systray.AddMenuItem("Проверить обновление", "Узнать, есть ли новая версия на GitHub")
 	a.mAbout = systray.AddMenuItem("О программе", "")
 	if a.debug {
 		systray.AddSeparator()
@@ -188,6 +192,8 @@ func (a *App) eventLoop() {
 			a.doSetMode(winbridge.ModeVPN)
 		case <-a.mModeSOCKS.ClickedCh:
 			a.doSetMode(winbridge.ModeSOCKS)
+		case <-a.mCheckUpd.ClickedCh:
+			go a.doCheckUpdate()
 		case <-a.mAbout.ClickedCh:
 			ShowInfo("О программе",
 				fmt.Sprintf("WgKeyBot v%s\n\nWireGuard VPN клиент\nс TURN/DTLS прокси\n\n© 2026 WgKeyBot", Version))
@@ -338,14 +344,25 @@ func (a *App) connect(automatic bool) {
 		func(reason string) { go a.doTurnFatal(mgr, reason) })
 }
 
+// Попытки реконнекта watchdog'а. Сеть, вернувшаяся после сна или смены
+// Wi-Fi, часто ещё какое-то время не везёт (DHCP, captive portal, DNS), и одна
+// неудачная попытка оставляла приложение отключённым до ручного подключения.
+const watchdogReconnectAttempts = 3
+
+// watchdogReconnectBackoff — пауза перед второй и третьей попыткой.
+var watchdogReconnectBackoff = [...]time.Duration{10 * time.Second, 30 * time.Second}
+
 // doWatchdogReconnect вызывается watchdog'ом когда WG handshake умер.
-// Отключает текущий туннель и переподключается с тем же конфигом.
+// Отключает текущий туннель и переподключается с тем же конфигом: ждёт
+// физический шлюз, если он у упавшего подключения был, и повторяет попытку,
+// если отказ не терминальный (winbridge.IsTerminalConnectError).
 func (a *App) doWatchdogReconnect() {
 	a.mu.Lock()
 	cfg := a.cfg
 	mode := a.settings.Mode
 	socksPort := a.settings.SocksPort
-	if a.connecting || a.disconnecting || a.manager == nil || cfg == nil || a.exiting.Load() {
+	old := a.manager
+	if a.connecting || a.disconnecting || old == nil || cfg == nil || a.exiting.Load() {
 		a.mu.Unlock()
 		return
 	}
@@ -357,6 +374,10 @@ func (a *App) doWatchdogReconnect() {
 		a.mu.Unlock()
 	}()
 
+	// Шлюз ждём, только если он был: на аплинке без next-hop (SOCKS поверх
+	// PPPoE) его не будет никогда.
+	hadGateway := old.HadGateway()
+
 	log.Printf("[Tray] Watchdog triggered reconnect")
 	a.teardown()
 
@@ -364,56 +385,114 @@ func (a *App) doWatchdogReconnect() {
 	a.setConnecting()
 	go Notify("WgKeyBot", "Соединение потеряно — переподключение...", niifWarning)
 
-	// Прерываемая 3-секундная пауза: храним cancel в a.cancel, чтобы
-	// doDisconnect мог прервать ожидание через teardown().
-	delayCtx, delayCancel := context.WithCancel(context.Background())
+	// Паузы и ожидание сети прерываемы: waitCancel лежит в a.cancel, и
+	// doDisconnect отменяет его через teardown().
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	defer waitCancel()
 	a.mu.Lock()
-	a.cancel = delayCancel
+	a.cancel = waitCancel
 	a.mu.Unlock()
 
-	select {
-	case <-delayCtx.Done():
-		// Пользователь нажал "Отключить" — teardown уже почистил a.cancel.
-		a.setDisconnected()
-		return
-	case <-time.After(3 * time.Second):
-	}
+	delay := 3 * time.Second
+	for attempt := 1; ; attempt++ {
+		if !sleepCtx(waitCtx, delay) || (hadGateway && !waitForGateway(waitCtx)) {
+			// Пользователь нажал "Отключить" — teardown уже почистил a.cancel.
+			a.setDisconnected()
+			return
+		}
 
-	// Снимаем cancel паузы и переходим к реальному подключению.
-	// (Если сюда дошли, значит time.After сработал раньше teardown — пауза прошла.)
-	a.mu.Lock()
-	a.cancel = nil
-	a.mu.Unlock()
-	delayCancel()
+		mgr := winbridge.NewManager(cfg)
+		mgr.SetMode(mode, socksPort)
+		ctx, cancel := context.WithCancel(context.Background())
 
-	mgr := winbridge.NewManager(cfg)
-	mgr.SetMode(mode, socksPort)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	a.mu.Lock()
-	a.manager = mgr
-	a.cfg = cfg
-	a.cancel = cancel
-	a.mu.Unlock()
-
-	if err := mgr.Connect(ctx); err != nil {
-		log.Printf("[Tray] watchdog reconnect error: %v", err)
 		a.mu.Lock()
-		a.manager = nil
-		a.cancel = nil
+		if waitCtx.Err() != nil {
+			a.mu.Unlock()
+			cancel()
+			a.setDisconnected()
+			return
+		}
+		a.manager = mgr
+		a.cfg = cfg
+		a.cancel = cancel
+		a.mu.Unlock()
+
+		err := mgr.Connect(ctx)
+		if err == nil {
+			if !a.setConnected(mgr) {
+				return
+			}
+			go a.watchStatus(ctx, mgr)
+			mgr.StartWatchdog(ctx,
+				func() { go a.doWatchdogReconnect() },
+				func(reason string) { go a.doTurnFatal(mgr, reason) })
+			return
+		}
+		log.Printf("[Tray] watchdog reconnect attempt %d/%d: %v", attempt, watchdogReconnectAttempts, err)
+
+		terminal := winbridge.IsTerminalConnectError(err)
+		retry := !terminal && !errors.Is(err, context.Canceled) && attempt < watchdogReconnectAttempts
+
+		// Одной критической секцией: teardown() уже снял mgr, если пользователь
+		// нажал "Отключить" во время попытки; иначе пауза перед следующей
+		// попыткой должна стать отменяемой раньше, чем кто-то увидит a.cancel
+		// пустым и решит, что отменять нечего.
+		a.mu.Lock()
+		stopped := a.manager != mgr
+		if !stopped {
+			a.manager = nil
+			a.cancel = nil
+			if retry {
+				a.cancel = waitCancel
+			}
+		}
 		a.mu.Unlock()
 		cancel()
-		a.setDisconnected()
-		return
-	}
 
-	if !a.setConnected(mgr) {
-		return
+		if stopped || !retry {
+			a.setDisconnected()
+			if terminal && !stopped {
+				go Notify("VPN", "Не удалось переподключиться: "+err.Error(), niifError)
+			}
+			return
+		}
+		delay = watchdogReconnectBackoff[attempt-1]
 	}
-	go a.watchStatus(ctx, mgr)
-	mgr.StartWatchdog(ctx,
-		func() { go a.doWatchdogReconnect() },
-		func(reason string) { go a.doTurnFatal(mgr, reason) })
+}
+
+// sleepCtx ждёт d; false — если ctx отменили раньше.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// waitForGateway ждёт, пока в таблице маршрутов появится физический дефолтный
+// шлюз; false — если ctx отменили раньше. Реконнект без шлюза падает (в
+// VPN-режиме — уже на NewRouteManager), так что пробовать до этого незачем.
+func waitForGateway(ctx context.Context) bool {
+	const poll = 2 * time.Second
+	logged := false
+	for {
+		if gw, _, err := winbridge.DefaultGateway(); err == nil && gw != "" {
+			if logged {
+				log.Printf("[Tray] Physical gateway is back: %s", gw)
+			}
+			return true
+		}
+		if !logged {
+			log.Printf("[Tray] No physical gateway — waiting for the network before reconnecting")
+			logged = true
+		}
+		if !sleepCtx(ctx, poll) {
+			return false
+		}
+	}
 }
 
 // doTurnFatal вызывается, когда TURN-прокси сообщил, что все воркеры сдались:
@@ -525,14 +604,20 @@ func (a *App) doImport() {
 		return
 	}
 
+	hash := winbridge.ConfigHash(data)
 	a.mu.Lock()
 	a.settings.AccessToken = accessToken
-	a.settings.LastConfigHash = winbridge.ConfigHash(data)
+	a.settings.LastConfigHash = hash
 	a.settings.LastRefresh = time.Now()
 	winbridge.SaveSettings(a.settings)
 	a.mu.Unlock()
 	a.loadConfigInfo()
 
+	// Импорт при поднятом туннеле раньше только сохранял конфиг: туннель
+	// работал на старом, пока его не переподключат вручную.
+	if a.applyToLiveTunnel(hash, "Импорт", "Настройки подключения получены, переподключение...") {
+		return
+	}
 	go Notify("Импорт", "Настройки подключения получены", niifInfo)
 }
 
@@ -544,8 +629,10 @@ func (a *App) doUpdate() { a.refreshConfig(true) }
 // если туннель поднят, — и отчитывается пользователю. Фоновый только
 // сохраняет: живой туннель он не трогает, новый конфиг вступит в силу при
 // следующем подключении. В обоих случаях конфиг, совпавший по SHA-256 с
-// последним сохранённым, не пересохраняется и не переподключает — раньше
-// ручное обновление рвало туннель даже ради того же самого конфига.
+// последним сохранённым, не пересохраняется — раньше ручное обновление рвало
+// туннель даже ради того же самого конфига. Ручное при этом всё же
+// переподключает туннель, поднятый на более старом конфиге: его могло
+// сохранить, не применив, фоновое обновление.
 func (a *App) refreshConfig(manual bool) {
 	if !a.refreshing.CompareAndSwap(false, true) {
 		return
@@ -585,11 +672,18 @@ func (a *App) refreshConfig(manual bool) {
 		a.settings.LastRefresh = time.Now()
 		winbridge.SaveSettings(a.settings)
 		a.mu.Unlock()
-		if manual {
-			go Notify("Обновление", "Конфиг актуален", niifInfo)
-		} else {
+		if !manual {
 			log.Printf("[Tray] auto-refresh: config unchanged")
+			return
 		}
+		// Сохранённый конфиг совпал, но фоновое обновление могло сохранить его,
+		// не применив: туннель тогда работает на старом. Ручное обновление
+		// сравнивает с тем, на котором он поднят, — как и дашборд, который в
+		// этот момент пишет «есть обновление».
+		if a.applyToLiveTunnel(hash, "Обновление", "Конфиг обновлён, переподключение...") {
+			return
+		}
+		go Notify("Обновление", "Конфиг актуален", niifInfo)
 		return
 	}
 
@@ -614,18 +708,26 @@ func (a *App) refreshConfig(manual bool) {
 	}
 
 	// Если VPN активен — переподключаемся на свежий конфиг.
-	a.mu.Lock()
-	connected := a.manager != nil
-	a.mu.Unlock()
-
-	if connected {
-		go Notify("Обновление", "Конфиг обновлён, переподключение...", niifInfo)
-		a.teardown()
-		a.doConnect()
+	if a.applyToLiveTunnel(hash, "Обновление", "Конфиг обновлён, переподключение...") {
 		return
 	}
-
 	go Notify("Обновление", "Конфиг обновлён", niifInfo)
+}
+
+// applyToLiveTunnel переподключает поднятый туннель, если он работает не на
+// конфиге с хешем hash, и сообщает об этом пользователю (title, note). Возвращает
+// true, если переподключение было.
+func (a *App) applyToLiveTunnel(hash, title, note string) bool {
+	a.mu.Lock()
+	stale := a.manager != nil && a.activeConfigHash != hash
+	a.mu.Unlock()
+	if !stale {
+		return false
+	}
+	go Notify(title, note, niifInfo)
+	a.teardown()
+	a.doConnect()
+	return true
 }
 
 // maybeAutoRefresh запускает фоновое обновление конфига, когда с последнего

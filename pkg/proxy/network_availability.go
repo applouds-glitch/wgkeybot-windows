@@ -38,6 +38,10 @@ var networkAvailability = struct {
 	unvalidatedProbeBusy bool
 	unvalidatedProbeID   uint64
 	becameAvailable      chan struct{}
+
+	// leftAt is when the host last reported the network gone or exchanged for
+	// another — what networkLeftSince measures an attempt against.
+	leftAt time.Time
 }{
 	androidValidated: true,
 	becameAvailable:  make(chan struct{}),
@@ -60,6 +64,10 @@ func setNetworkAvailable(validated bool) {
 
 	now := time.Now()
 	wasAvailable := networkAvailableLocked(now)
+	left := networkAvailability.androidValidated && !validated
+	if left {
+		networkAvailability.leftAt = now
+	}
 	networkAvailability.androidValidated = validated
 	if validated {
 		networkAvailability.nextUnvalidatedProbe = time.Time{}
@@ -68,6 +76,14 @@ func setNetworkAvailable(validated bool) {
 	}
 	if !wasAvailable && networkAvailableLocked(now) {
 		signalNetworkWaitersLocked()
+	}
+	if left {
+		// The sockets' network is gone: the allocations they hold can no longer
+		// release themselves (orphaned_allocations.go). Only on the transition —
+		// the host repeats "no network" on every poll.
+		networkAvailability.Unlock()
+		orphanLiveAllocations(now)
+		networkAvailability.Lock()
 	}
 }
 
@@ -105,10 +121,46 @@ func beginNetworkPathGeneration() uint64 {
 	return networkAvailability.transportGeneration
 }
 
-// resetNetworkPathProof prevents proof from an old proxy generation or
-// physical network from authorising work on a new path.
+// resetNetworkPathProof prevents proof from an old proxy generation from
+// authorising work for the next one.
 func resetNetworkPathProof() {
 	beginNetworkPathGeneration()
+}
+
+// clearNetworkPathProof drops what the old physical network proved, so it cannot
+// authorise work on the new one. Unlike resetNetworkPathProof it keeps the
+// proxy's generation: the streams carry the token they were started with for
+// the proxy's whole life, reconnects included, so a new generation here would
+// turn every later proof — from streams already on the new path too — into a
+// no-op until the proxy is restarted.
+func clearNetworkPathProof() {
+	networkAvailability.Lock()
+	defer networkAvailability.Unlock()
+
+	networkAvailability.transportProvenUntil = time.Time{}
+	networkAvailability.nextUnvalidatedProbe = time.Time{}
+	networkAvailability.unvalidatedProbeBusy = false
+	networkAvailability.unvalidatedProbeID++
+}
+
+// noteNetworkLeft records that the network the sessions were started on has been
+// exchanged for another (the host's network-change signal).
+func noteNetworkLeft() {
+	networkAvailability.Lock()
+	networkAvailability.leftAt = time.Now()
+	networkAvailability.Unlock()
+}
+
+// networkLeftSince reports whether the host says there is no network now, or
+// the network in use at since has been lost or exchanged for another after it.
+//
+// It asks the host's signal, not the effective gate: fresh transport proof keeps
+// the gate open for minutes after the host has said the network is gone, and
+// what fails in those minutes is exactly what must not be held against a relay.
+func networkLeftSince(since time.Time) bool {
+	networkAvailability.Lock()
+	defer networkAvailability.Unlock()
+	return !networkAvailability.androidValidated || networkAvailability.leftAt.After(since)
 }
 
 func isNetworkAvailable() bool {

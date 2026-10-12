@@ -2,15 +2,18 @@ package winbridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wgkeybot/windows/pkg/proxy"
+	"github.com/wgkeybot/windows/pkg/watchdog"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
@@ -46,6 +49,12 @@ type Manager struct {
 	wgLUID    winipcfg.LUID // wintun adapter LUID (VPN mode), for route cleanup on disconnect
 	netWatch  *NetworkWatcher
 	connected bool
+
+	// netLost — физический шлюз был и пропал. Ведёт CheckNetworkChange; без
+	// сети watchdog не объявляет туннель мёртвым. Если шлюза не было с самого
+	// подключения (SOCKS-режим на аплинке без next-hop, например PPPoE), флаг
+	// так и остаётся false — иначе watchdog на таком аплинке молчал бы всегда.
+	netLost atomic.Bool
 }
 
 // NewManager создаёт Manager для заданного конфига в режиме VPN.
@@ -72,6 +81,30 @@ func (m *Manager) SetMode(mode Mode, socksPort int) {
 }
 
 // Connect запускает тоннель: TURN-прокси → WireGuard → маршруты.
+// terminalConnectError — отказ Connect, который повтор не исправит: VK-авторизация
+// устарела, звонок мёртв, TURN-прокси сдался, капча не решена, в конфиге нет
+// TURN. Реконнект watchdog'а на нём останавливается, а не повторяет попытку.
+type terminalConnectError struct{ err error }
+
+func (e *terminalConnectError) Error() string { return e.err.Error() }
+func (e *terminalConnectError) Unwrap() error { return e.err }
+
+func terminal(err error) error { return &terminalConnectError{err: err} }
+
+// IsTerminalConnectError сообщает, что ошибку Connect повтор не исправит.
+func IsTerminalConnectError(err error) bool {
+	var t *terminalConnectError
+	return errors.As(err, &t)
+}
+
+// HadGateway сообщает, был ли у подключения физический шлюз — при подключении
+// или появившийся после (см. CheckNetworkChange).
+func (m *Manager) HadGateway() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.physGW != ""
+}
+
 // ctx используется для отмены ожидания (captcha, timeout).
 func (m *Manager) Connect(ctx context.Context) error {
 	m.mu.Lock()
@@ -98,6 +131,7 @@ func (m *Manager) Connect(ctx context.Context) error {
 			m.tunnel = nil
 		}
 		if m.routeMgr != nil {
+			proxy.ClearBypassRouter(m.routeMgr)
 			m.routeMgr.Cleanup()
 			m.routeMgr = nil
 		}
@@ -116,6 +150,9 @@ func (m *Manager) Connect(ctx context.Context) error {
 		}
 		routeMgr = rm
 		m.routeMgr = rm
+		// Прокси спрашивает маршрут перед каждым дозвоном (pkg/proxy/bypass.go):
+		// адреса, узнанные уже под поднятым VPN, тоже уходят мимо туннеля.
+		proxy.SetBypassRouter(rm)
 	}
 
 	// 1b. Физический шлюз — точка отсчёта для детекта смены сети (в обоих
@@ -141,12 +178,12 @@ func (m *Manager) Connect(ctx context.Context) error {
 	}
 
 	if proxyCfg.VKLink == "" {
-		return fmt.Errorf(
+		return terminal(fmt.Errorf(
 			"конфиг %q не содержит настроек TURN.\n\n"+
 				"Убедитесь, что конфиг получен через бота @wg_key_bot\n"+
 				"и содержит строку #@wgt:VKLink = ...",
 			cfg.Name,
-		)
+		))
 	}
 
 	// 4. Создаём и запускаем TURN-прокси.
@@ -171,26 +208,31 @@ func (m *Manager) Connect(ctx context.Context) error {
 	// ReadyStatusCaptchaRequired несколько раз подряд — loop обрабатывает все раунды.
 	log.Printf("[Manager] Waiting for TURN proxy ready...")
 	for {
-		status := t.WaitReady(90 * time.Second)
+		status := t.WaitReadyContext(ctx, 90*time.Second)
+		// Отмена («Отключить» во время подключения) — выходим сразу, не поднимая
+		// WireGuard и маршруты; прокси остановит defer выше.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if status == proxy.ReadyStatusOK {
 			break
 		}
 		switch status {
 		case proxy.ReadyStatusCaptchaRequired:
 			captchaURL := t.PendingCaptchaURL()
-			log.Printf("[Manager] Captcha required: %s", captchaURL)
+			log.Printf("[Manager] Captcha required: %s", proxy.CaptchaURLForLog(captchaURL))
 			token, err := SolveCaptchaProxy(ctx, captchaURL)
 			if err != nil {
-				return fmt.Errorf("captcha: %w", err)
+				return terminal(fmt.Errorf("captcha: %w", err))
 			}
 			t.SolveCaptcha(token)
 			// Continue loop: pkg/proxy may request another captcha (next solve mode).
 		case proxy.ReadyStatusAuthRequired:
-			return fmt.Errorf("VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»")
+			return terminal(errors.New(msgCallRequiresAuth))
 		case proxy.ReadyStatusCallUnavailable:
-			return fmt.Errorf("VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг")
+			return terminal(errors.New(msgCallUnavailable))
 		case proxy.ReadyStatusTurnFatal:
-			return fmt.Errorf("TURN недоступен: %s — попробуйте позже или обновите конфиг", t.TurnFatalReason())
+			return terminal(fmt.Errorf(msgTurnFatal, t.TurnFatalReason()))
 		default:
 			return fmt.Errorf("TURN proxy failed (status %d)", status)
 		}
@@ -263,11 +305,12 @@ func (m *Manager) Connect(ctx context.Context) error {
 		}
 
 		// 11b. Bypass-маршруты для VK/OK auth-хостов (login/api/id/static.vk.ru,
-		//      calls.okcdn.ru) по их зарезолвленным при bootstrap IP. Без этого
-		//      ре-фетч credentials после поднятия VPN уходит в туннель и виснет
-		//      (туннелю нужны creds, а creds нужен туннель). Используем тот же
+		//      calls.okcdn.ru). Без этого ре-фетч credentials после поднятия VPN
+		//      уходит в туннель и виснет (туннелю нужны creds, а creds нужен
+		//      туннель). Список резолвится здесь, до AllowedIPs, даже если этот
+		//      старт взял креды из кеша и в VK не ходил. Используем тот же
 		//      механизм /32-через-physGW, маршруты снимаются на Disconnect.
-		if authIPs := m.tunnel.AuthBypassIPs(); len(authIPs) > 0 {
+		if authIPs := m.tunnel.AuthBypassIPs(ctx); len(authIPs) > 0 {
 			log.Printf("[Manager] Adding auth bypass routes for: %v", authIPs)
 			routeMgr.AddTURNRoutes(authIPs)
 		}
@@ -291,6 +334,88 @@ func (m *Manager) Connect(ctx context.Context) error {
 	connected = true // disarm cleanup defer
 	log.Printf("[Manager] Tunnel %q connected", cfg.Name)
 	return nil
+}
+
+// Тексты терминальных отказов TURN-прокси — одни и те же при подключении и
+// при перезапуске транспорта (tray.turnFatalMessage узнаёт их по маркерам).
+const (
+	msgCallRequiresAuth = "VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»"
+	msgCallUnavailable  = "VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг"
+	msgTurnFatal        = "TURN недоступен: %s — попробуйте позже или обновите конфиг"
+)
+
+// errNotConnected — перезапуск транспорта запрошен у отключённого туннеля.
+var errNotConnected = errors.New("tunnel is not connected")
+
+// rebuildBudget — сколько всего ждать старта перезапущенного прокси, пока на
+// экране нет капчи: пре-фетч кредов (до трёх попыток по 20 с) плюс 30 с
+// стартового таймаута самого прокси, с запасом.
+const rebuildBudget = 4 * time.Minute
+
+// RebuildTransport перезапускает TURN-транспорт под живым WireGuard — шаг
+// watchdog'а перед тем, как сдаться на сессии, у которой минуты нет handshake
+// (см. pkg/watchdog.Course). Воркеры всё это время переподключаются сами; что
+// добавляет перезапуск — чистый старт (новые сессии на сервере, забытые
+// здоровье релеев и выборы) и, при newCredentials, новая VK-идентичность ценой
+// одного похода в VK. Device, wintun/netstack, SOCKS-сервер и маршруты
+// остаются: приложения не теряют соединений, а WireGuard так и шлёт на тот же
+// локальный порт. Новые адреса релеев получают bypass-маршруты по требованию
+// (RouteManager.EnsureBypassRoute).
+//
+// Manager.mu не держится на время ожидания: опрос статуса, доставка капчи
+// (tray.watchStatus) и «Отключить» должны проходить. Отмена ctx (teardown)
+// прерывает ожидание сразу. Терминальный отказ (VK-авторизация, мёртвый звонок,
+// TURN fatal) возвращается как terminalConnectError — как у Connect.
+func (m *Manager) RebuildTransport(ctx context.Context, newCredentials bool) error {
+	m.mu.Lock()
+	t := m.tunnel
+	connected := m.connected
+	m.mu.Unlock()
+	if !connected || t == nil {
+		return errNotConnected
+	}
+	line := "No WireGuard handshake for minutes — rebuilding the TURN transport"
+	if newCredentials {
+		line += " on new credentials"
+	}
+	log.Printf("[Manager] %s", line)
+	if err := t.RestartTransport(newCredentials); err != nil {
+		return err
+	}
+	return m.awaitTransport(ctx, t)
+}
+
+// awaitTransport ждёт, пока перезапущенный прокси поднимет первый поток.
+// Капчу по дороге решает опрос tray (watchStatus → PendingCaptchaURL →
+// SolveCaptchaProxy) — тот же путь, что и для ре-фетча кредов посреди сессии, —
+// поэтому здесь ожидание не прерывается на капче, а продолжается, пока она
+// висит; без капчи оно ограничено rebuildBudget.
+func (m *Manager) awaitTransport(ctx context.Context, t *proxy.Tunnel) error {
+	deadline := time.Now().Add(rebuildBudget)
+	for {
+		status, started := t.WaitStartedContext(ctx, 30*time.Second)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !started {
+			if t.PendingCaptchaURL() != "" || time.Now().Before(deadline) {
+				continue
+			}
+			return fmt.Errorf("TURN transport did not start within %v", rebuildBudget)
+		}
+		switch status {
+		case proxy.ReadyStatusOK:
+			return nil
+		case proxy.ReadyStatusAuthRequired:
+			return terminal(errors.New(msgCallRequiresAuth))
+		case proxy.ReadyStatusCallUnavailable:
+			return terminal(errors.New(msgCallUnavailable))
+		case proxy.ReadyStatusTurnFatal:
+			return terminal(fmt.Errorf(msgTurnFatal, t.TurnFatalReason()))
+		default:
+			return fmt.Errorf("TURN transport failed to start (status %d)", status)
+		}
+	}
 }
 
 // Disconnect корректно останавливает тоннель и очищает маршруты.
@@ -331,6 +456,7 @@ func (m *Manager) Disconnect() {
 
 	// Удаляем TURN host-маршруты
 	if m.routeMgr != nil {
+		proxy.ClearBypassRouter(m.routeMgr)
 		m.routeMgr.Cleanup()
 		m.routeMgr = nil
 	}
@@ -408,9 +534,10 @@ func (m *Manager) SolveCaptcha(answer string) {
 }
 
 // CheckNetworkChange сверяет текущий физический дефолтный шлюз с записанным
-// и делает две вещи. Во-первых, сообщает прокси, есть ли сеть вообще: без
-// шлюза воркеры ждут у гейта вместо того, чтобы жечь креды и Allocate-квоту
-// (proxy.SetNetworkAvailable, переходы логируются там). Во-вторых, если шлюз
+// и делает две вещи. Во-первых, сообщает прокси и watchdog'у, есть ли сеть
+// вообще: без шлюза воркеры ждут у гейта вместо того, чтобы жечь креды и
+// Allocate-квоту (proxy.SetNetworkAvailable, переходы логируются там), а
+// watchdog не объявляет туннель мёртвым (netLost). Во-вторых, если шлюз
 // сменился — уведомляет туннель: сброс DNS-кеша и доказательства пути, потоки
 // переподключаются по мере отвала. Возвращает true, если сеть сменилась.
 //
@@ -419,6 +546,7 @@ func (m *Manager) SolveCaptcha(answer string) {
 func (m *Manager) CheckNetworkChange() bool {
 	m.mu.Lock()
 	t := m.tunnel
+	rm := m.routeMgr
 	prevGW := m.physGW
 	m.mu.Unlock()
 
@@ -429,6 +557,13 @@ func (m *Manager) CheckNetworkChange() bool {
 	gw, _, err := DefaultGateway()
 	online := err == nil && gw != ""
 	proxy.SetNetworkAvailable(online)
+	if lost := !online && prevGW != ""; m.netLost.Swap(lost) != lost {
+		if lost {
+			log.Printf("[Manager] Physical gateway %s lost — waiting for the network", prevGW)
+		} else {
+			log.Printf("[Manager] Physical gateway is back: %s", gw)
+		}
+	}
 	if !online || gw == prevGW {
 		return false
 	}
@@ -445,6 +580,11 @@ func (m *Manager) CheckNetworkChange() bool {
 	}
 
 	log.Printf("[Manager] Gateway changed: %s -> %s", prevGW, gw)
+	// Сначала маршруты: воркеры прокси начнут передозваниваться до релеев сразу
+	// после сигнала, и host-маршруты через старый шлюз увели бы их в туннель.
+	if rm != nil {
+		rm.Refresh()
+	}
 	t.OnNetworkChange()
 	return true
 }
@@ -476,25 +616,19 @@ func sanitizeIfaceName(name string) string {
 }
 
 // StartWatchdog запускает фоновую горутину, которая следит за состоянием WG
-// handshake. Если handshake устарел (>3 мин) при растущем TX — соединение
-// считается мёртвым, и вызывается onDead. Если же TURN-прокси сообщил, что все
-// воркеры сдались, вызывается onFatal: это диагноз, а не симптом, и
+// handshake (решение — в pkg/watchdog). Если handshake устарел (>3 мин) при
+// растущем TX — соединение считается мёртвым: сначала дважды перезапускается
+// TURN-транспорт под живым WireGuard (второй раз на новых кредах,
+// RebuildTransport), и лишь затем вызывается onDead — полный реконнект. Если
+// же TURN-прокси сообщил, что все воркеры сдались, или перезапуск упёрся в
+// терминальный отказ, вызывается onFatal: это диагноз, а не симптом, и
 // переподключение уехало бы в ту же стену. Горутина завершается при отмене ctx
 // или если туннель уже отключён.
 func (m *Manager) StartWatchdog(ctx context.Context, onDead func(), onFatal func(reason string)) {
-	const (
-		pollInterval  = 30 * time.Second
-		staleAfter    = 3 * time.Minute
-		neverAfter    = 150 * time.Second
-		deadChecksMax = 2
-	)
 	go func() {
-		ticker := time.NewTicker(pollInterval)
+		ticker := time.NewTicker(watchdog.PollInterval)
 		defer ticker.Stop()
-		upSince := time.Now()
-		var prevTx uint64
-		prevTxSet := false
-		deadChecks := 0
+		w := watchdog.NewCourse(time.Now())
 		for {
 			select {
 			case <-ctx.Done():
@@ -516,33 +650,52 @@ func (m *Manager) StartWatchdog(ctx context.Context, onDead func(), onFatal func
 				}
 				return
 			}
+			now := time.Now()
 			// Пока висит капча, TURN-прокси заблокирован в ожидании ответа
 			// пользователя, поэтому WG handshake закономерно устаревает. Это НЕ
 			// мёртвый туннель: reconnect здесь отменил бы ctx и снёс окно капчи
 			// прямо во время решения, зациклив процесс. Сбрасываем счётчики, чтобы
 			// после решения капчи туннель получил свежий grace-период.
 			if m.PendingCaptchaURL() != "" {
-				upSince = time.Now()
-				prevTxSet = false
-				deadChecks = 0
+				w.Hold(now)
 				continue
 			}
-			now := time.Now()
-			isDead := false
-			if stats.LastHandshake.IsZero() {
-				isDead = now.Sub(upSince) > neverAfter
-			} else if now.Sub(stats.LastHandshake) > staleAfter {
-				isDead = prevTxSet && stats.TxBytes > prevTx
-			}
-			prevTx = stats.TxBytes
-			prevTxSet = true
-			if !isDead {
-				deadChecks = 0
+			// Без сети туннель не мёртв, а ждёт её: реконнект без шлюза падает
+			// (в VPN-режиме — уже на NewRouteManager), и приложение оставалось
+			// отключённым до ручного подключения.
+			if m.netLost.Load() {
+				w.Offline(now)
 				continue
 			}
-			deadChecks++
-			if deadChecks >= deadChecksMax {
-				log.Printf("[Manager] Watchdog: WG handshake stale — triggering reconnect")
+			switch step := w.Poll(now, stats.LastHandshake, stats.TxBytes); step {
+			case watchdog.StepResumed:
+				log.Printf("[Watchdog] Resumed from sleep — handshake gets %v to recover", watchdog.NeverAfter)
+			case watchdog.StepRecovered:
+				log.Printf("[Watchdog] WG handshakes again after the transport rebuild")
+			case watchdog.StepRebuild, watchdog.StepRebuildNewCreds:
+				newCreds := step == watchdog.StepRebuildNewCreds
+				log.Printf("[Watchdog] WG handshake stale — rebuilding the TURN transport (%d/%d)", w.Rebuilds(), watchdog.Rebuilds)
+				err := m.RebuildTransport(ctx, newCreds)
+				switch {
+				case err == nil:
+					log.Printf("[Watchdog] TURN transport rebuilt — handshake gets %v", watchdog.RebuiltGrace)
+					w.Rebuilt(time.Now())
+				case ctx.Err() != nil, errors.Is(err, errNotConnected):
+					return
+				case IsTerminalConnectError(err):
+					log.Printf("[Watchdog] TURN rebuild hit a terminal failure: %v — stopping without reconnect", err)
+					if onFatal != nil {
+						onFatal(err.Error())
+					}
+					return
+				default:
+					// Не стартовал — вердикт следующего шага решит: ещё один
+					// перезапуск или полный реконнект.
+					log.Printf("[Watchdog] TURN rebuild did not start: %v — the next verdict decides", err)
+					w.Rebuilt(time.Now())
+				}
+			case watchdog.StepTearDown:
+				log.Printf("[Manager] Watchdog: WG handshake still stale after %d transport rebuilds — triggering reconnect", watchdog.Rebuilds)
 				onDead()
 				return
 			}

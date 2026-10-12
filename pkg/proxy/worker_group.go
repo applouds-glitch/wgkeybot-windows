@@ -109,6 +109,9 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 
 	failStreak := 0
 	credFailStreak := 0 // consecutive credential fetches that failed for any reason
+	// The credential that has had its one more try after a 486 beside a relay
+	// that never answered (see quotaBesideSilence).
+	quotaGraceUsed := ""
 	for {
 		permit, ok := waitForNetworkPermit(ctx, true)
 		if !ok {
@@ -199,13 +202,16 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		addrs = applyTurnOverride(addrs, cfg)
 
 		// Where this stream runs: the session's elected server once one is
-		// chosen, otherwise round-robin by stream ID. The rest of the list
-		// follows only as failover for this attempt.
-		addrs = assignServers(addrs, s.id)
-		attemptHead := addrs[0]
+		// chosen, otherwise round-robin by stream ID, with the relays still
+		// holding our orphaned allocations for this credential moved last
+		// (orphaned_allocations.go). The rest of the list follows only as
+		// failover for this attempt. Keep the full list for the later retry
+		// decision, including relays that recover meanwhile.
+		ordered := attemptOrder(user, addrs, s.id, time.Now())
+		attemptHead := ordered[0]
 
 		start := time.Now()
-		runErr := s.runWithCreds(ctx, user, pass, addrs, cfg)
+		runErr := s.runWithCreds(ctx, user, pass, ordered, cfg)
 		sessionDur := time.Since(start)
 		releaseNetworkPermit(permit)
 
@@ -233,14 +239,41 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 			continue
 		}
 
+		// A 486 right after our own release on one of these relays is VK not
+		// having processed that release yet, not a full credential: try the same
+		// one again shortly, without rotating it or cooling down, and without
+		// counting a failure (see releaseSettleWindow).
+		if relay, age, ok := settlingQuotaError(runErr, user, ordered, time.Now()); ok {
+			wait := releaseSettleRetry()
+			turnLog("[WORKER %d] 486 with our release on %s only %v old — VK has not freed it yet, same creds again in %v",
+				s.id, relay, age.Round(100*time.Millisecond), wait.Round(100*time.Millisecond))
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
 		// Auth/quota error → throttled, single-flight credential re-fetch so the
 		// next iteration picks up a fresh credential. Healthy siblings untouched.
 		// Every other error is transient from this worker's point of view: it
 		// reconnects (with backoff) rather than giving up, so a stream always
 		// recovers on its own — WireGuard and the sibling streams keep running
 		// while just this stream is recreated.
-		if classifyCredError(runErr) {
-			refreshGroupCreds(cfg.GroupID)
+		//
+		// One exception, once per credential: a 486 from one relay while another's
+		// Allocate ended without a TURN answer is tried again as it is before VK
+		// is asked for anything (quotaGraceApplies).
+		graced := false
+		if quota, silent, ok := quotaGraceApplies(runErr, user, quotaGraceUsed, credsReplaced(cfg.GroupID, user)); ok {
+			quotaGraceUsed = user
+			graced = true
+			turnLog("[WORKER %d] 486 from %s while %s gave no answer — one more try on the same creds before they are given up",
+				s.id, quota, silent)
+		}
+		if !graced && classifyCredError(runErr) {
+			refreshGroupCreds(cfg.GroupID, user)
 		}
 
 		// A session that stayed up for a while was healthy; treat its drop as a
@@ -259,23 +292,45 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		// that failed twice on a dead relay waited 7-17s before trying the
 		// working one — most of the connect budget, spent sleeping next to a
 		// server that was already known to work.
-		if assignServers(addrs, s.id)[0] != attemptHead {
+		if attemptOrder(user, addrs, s.id, time.Now())[0] != attemptHead {
 			failStreak = 0
 		}
 
 		retryDelay := reconnectDelay(failStreak)
+		note := ""
 		// 486 (TURN allocation quota) after a mass teardown — say a host freeze
-		// past the relay idle timeout, where the kernel closed our sockets but the
-		// server-side allocations survive as zombies still holding the credential's
-		// quota — is a special case: a fast retry just hits 486 again before the
-		// single-flight refreshGroupCreds can land a fresh credential with a fresh
-		// quota. Replace the 0.5-1s retry with a long jittered cooldown: (a) give
-		// the refetch time to arrive, (b) spread the N workers that failed at the
-		// same instant so they don't hammer the server in lockstep.
-		if isQuotaError(runErr) {
-			retryDelay = quotaCooldown()
+		// past the relay idle timeout, or a second network drop within ten
+		// minutes, where the server-side allocations survive as ghosts still
+		// holding the credential's quota — needs a new credential.
+		//
+		// If this credential has already been replaced — this worker's
+		// refreshGroupCreds above force-expired the slot, or a sibling's did, or
+		// the new one is already in — the 486 says nothing about the next
+		// attempt, which runs on another identity. Retry at once: the first
+		// worker back fetches the new credential (the slot lock single-flights
+		// it), the rest take it from the cache. The rotation is lazy — nothing
+		// fetches until a worker comes back for it — so the long cooldown here
+		// only postponed the fetch: on an Android device on 2026-09-18 the new
+		// credential was requested 5.2s after the rotation, the last stream came
+		// back 15s after the network did.
+		//
+		// A 486 on the credential that is still current (the rotation was
+		// throttled: it is the one fetched moments ago) gets the long jittered
+		// cooldown, so a quota that stays full is not hammered in lockstep.
+		if graced {
+			// At once, whatever the streak: this is the try the credential is owed.
+			retryDelay = reconnectDelay(0)
+			note = " (one more try on these creds)"
+		} else if isQuotaError(runErr) {
+			if credsReplaced(cfg.GroupID, user) {
+				failStreak = 0
+				retryDelay = reconnectDelay(failStreak)
+				note = " (on replaced creds)"
+			} else {
+				retryDelay = quotaCooldown()
+			}
 		}
-		turnLog("[WORKER %d] Error (streak %d): %v → retry in %v", s.id, failStreak, runErr, retryDelay)
+		turnLog("[WORKER %d] Error (streak %d): %v → retry in %v%s", s.id, failStreak, runErr, retryDelay, note)
 		select {
 		case <-time.After(retryDelay):
 		case <-ctx.Done():
@@ -387,9 +442,11 @@ func isTransportError(err error) bool {
 	return errors.As(err, &syscallErr)
 }
 
-// quotaCooldown is the jittered backoff after a 486. 5-13s gives the single-flight
-// refreshGroupCreds time to land a fresh credential (new quota) and spreads the
-// N simultaneously-saturated workers so they don't retry in lockstep and re-hit 486.
+// quotaCooldown is the jittered backoff after a 486 on a credential that is still
+// current — its rotation was throttled, so the next attempt would run on the same
+// full quota. 5-13s spreads the N simultaneously-saturated workers so they don't
+// retry in lockstep and re-hit 486. (A 486 on a credential already replaced
+// retries at once; see runWorker.)
 func quotaCooldown() time.Duration {
 	return 5*time.Second + time.Duration(rand.Intn(8001))*time.Millisecond
 }

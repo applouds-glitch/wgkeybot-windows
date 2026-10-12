@@ -20,6 +20,10 @@ func TestNativeWindowControls(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.dispose()
+	// WS_CLIPCHILDREN leaves group box interiors unpainted.
+	if style, _, _ := user32dll.NewProc("GetWindowLongW").Call(w.hwnd, ^uintptr(15)); style&0x02000000 != 0 {
+		t.Fatal("native window must not clip children")
+	}
 	edit := w.add("EDIT", "", 0x00800000|wsTabstop, 10, 20, 20, 420, 28, 0)
 	edit.setText("Проверка Unicode — VPN & SOCKS")
 	var buf [128]uint16

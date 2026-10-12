@@ -7,6 +7,9 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,8 +30,8 @@ type StreamCredentialsCache struct {
 	creds TurnCredentials
 	mutex sync.RWMutex
 
-	// refreshMu guards lastRefresh and serialises the throttle decision in
-	// refreshGroupCreds independently of the creds lock above.
+	// refreshMu guards lastRefresh, the throttle's clock in refreshGroupCreds
+	// (taken there inside mutex, never the other way round).
 	refreshMu   sync.Mutex
 	lastRefresh time.Time // guarded by refreshMu
 }
@@ -36,8 +39,9 @@ type StreamCredentialsCache struct {
 const (
 	// credentialLifetime is the fallback TTL used when the VK API reports no
 	// lifetime of its own — which is what it always does in practice
-	// (api_ttl=0s in every "Credentials cached until" log line), so this is the
-	// TTL. It is deliberately generous: guessing low is the expensive mistake.
+	// (api_ttl=0s in every "Credentials … cached for" log line) — and the
+	// username carries no expiry stamp either (credentialExpiryFromUsername).
+	// It is deliberately generous: guessing low is the expensive mistake.
 	// A stream that dies after more than one TTL forces a full four-step VK
 	// re-auth even though the credential is demonstrably still good (logs show
 	// cache slots living 46m and 3h between fetches), and every extra VK
@@ -48,6 +52,13 @@ const (
 	// TTL and let the error path drive the re-fetch.
 	credentialLifetime = 60 * time.Minute
 	cacheSafetyMargin  = 60 * time.Second
+	// credentialExpiryBuffer is subtracted from the expiry VK stamps into the
+	// TURN username (see credentialExpiryFromUsername). pion refreshes every
+	// allocation at half its lifetime, so a credential that expires mid-session
+	// costs a 401 on that refresh, a stream restart and a VK trip; stop handing
+	// it out well before that. VK's usernames carry an expiry hours away, so the
+	// buffer costs nothing in practice.
+	credentialExpiryBuffer = 15 * time.Minute
 	// credRefreshThrottle is the minimum gap between error-driven credential
 	// re-fetches for one cache slot. The first worker in a slot that hits an
 	// auth/quota error force-expires the slot; siblings that fail within this
@@ -142,32 +153,54 @@ func ActiveTURNAddrs() []string {
 	return addrs
 }
 
-// invalidateGroupCreds force-expires the cached credential for a single group so
-// the next getCredsCached goes back to the VK API for a fresh one. Unlike
-// invalidateAllCaches it does NOT delete the slot: keeping the same
-// *StreamCredentialsCache pointer means the per-slot cache.mutex in
-// getCredsCached still single-flights the re-fetch across the group's workers
-// (the first re-fetches, the rest get a cache hit). Called when the TURN server
-// rejects allocations for this credential (stale/401/486).
-func invalidateGroupCreds(groupID int) {
-	cache := getStreamCache(groupID * streamsPerCredValue())
-	cache.mutex.Lock()
+// expireCredsLocked force-expires the slot, so that the next getCredsCached goes
+// back to the VK API, and says how long its credential had lived; cache.mutex is
+// held for writing. The slot is kept, not deleted (unlike invalidateAllCaches):
+// the same *StreamCredentialsCache means its mutex still single-flights the
+// re-fetch across the group's workers — the first re-fetches, the rest get a
+// cache hit.
+func expireCredsLocked(cache *StreamCredentialsCache) time.Duration {
 	var lived time.Duration
 	if !cache.creds.FetchedAt.IsZero() {
 		lived = time.Since(cache.creds.FetchedAt).Round(time.Second)
 	}
 	cache.creds.ExpiresAt = time.Now().Add(-time.Second)
-	cache.mutex.Unlock()
-	turnLog("[Auth] Credential cache for group %d force-expired (lived %v)", groupID, lived)
+	return lived
 }
 
-// refreshGroupCreds is the throttled, error-driven re-fetch entry point used by
-// workers. The first worker in a slot to hit an auth/quota error force-expires
-// the slot; siblings that fail within credRefreshThrottle become no-ops and
-// reuse the credential the first worker's next getCredsCached fetches. Throttle
-// state lives behind refreshMu so the decision is independent of the creds lock.
-func refreshGroupCreds(groupID int) {
+// refreshGroupCreds is the error-driven re-fetch entry point used by workers:
+// the TURN server has rejected an allocation made with user (stale/401/486),
+// so the group's slot is force-expired and the next getCredsCached goes to VK —
+// if user is what the slot holds.
+//
+// It used to expire whatever the slot held. The rejections of one credential do
+// not arrive together: a worker's attempt can end many seconds after its
+// siblings' (a fallback Allocate queued behind a silent relay, a session that
+// outlived the rotation), and the slot's lock is held across the whole fetch —
+// a VK round trip, or a captcha ladder of minutes — so a rejection of the OLD
+// credential would wait that out here and then expire the NEW one it had just
+// produced: another trip to VK, right after a captcha, for a credential nobody
+// had refused. The throttle below only covered the first credRefreshThrottle of
+// it. Now a rejection of a username the slot no longer holds changes nothing,
+// not even the throttle's clock. The username is all that tells one credential
+// from the next; VK's carry a timestamp and have not been seen to repeat, and if
+// one did, this would act on it as it always used to.
+//
+// The throttle stays for what it is still needed for: a fresh credential that is
+// refused at once as well (a quota that is simply full) is rotated at most once
+// per credRefreshThrottle, however many workers report it.
+func refreshGroupCreds(groupID int, user string) {
 	cache := getStreamCache(groupID * streamsPerCredValue())
+
+	// The comparison and the expiry under one hold of the lock: checked apart,
+	// a fetch could land between them.
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	if cache.creds.Username != user {
+		turnLog("[Auth] Group %d: the rejected credential %s is already replaced — nothing to refresh", groupID, credsTag(user))
+		return
+	}
 
 	cache.refreshMu.Lock()
 	if !cache.lastRefresh.IsZero() && time.Since(cache.lastRefresh) < credRefreshThrottle {
@@ -179,7 +212,47 @@ func refreshGroupCreds(groupID int) {
 	cache.lastRefresh = time.Now()
 	cache.refreshMu.Unlock()
 
-	invalidateGroupCreds(groupID)
+	lived := expireCredsLocked(cache)
+	turnLog("[Auth] Credential cache for group %d force-expired (lived %v)", groupID, lived)
+}
+
+// credsReplaced reports whether user is no longer the group's credential: its
+// slot has been force-expired, has expired, or already holds another one.
+//
+// A slot whose lock is taken reads as replaced without waiting for it. The lock
+// is held across a whole fetch — a VK round trip, or a captcha ladder that can
+// run for minutes — and a fetch only runs for a slot that is being replaced.
+// The other holders are a sibling's cache hit and refreshGroupCreds, for
+// microseconds; losing that race costs one fast retry on the same credential,
+// whose 486 then reads correctly.
+func credsReplaced(groupID int, user string) bool {
+	cache := getStreamCache(groupID * streamsPerCredValue())
+	if !cache.mutex.TryRLock() {
+		return true
+	}
+	defer cache.mutex.RUnlock()
+	return cache.creds.Username != user || !time.Now().Before(cache.creds.ExpiresAt)
+}
+
+// cacheMissReason says, for the log, why the slot's previous credential could not
+// serve link. A slot is missed not only when it expires but also when the
+// group's link has changed, and then its expiry still lies ahead — which the
+// log used to print as "expired -58m20s ago".
+func cacheMissReason(prev TurnCredentials, link string, now time.Time) string {
+	lived := now.Sub(prev.FetchedAt).Round(time.Second)
+	if prev.Link != link {
+		return fmt.Sprintf("cached creds are for another link (lived %v)", lived)
+	}
+	return fmt.Sprintf("previous creds lived %v (expired %v ago)", lived, now.Sub(prev.ExpiresAt).Round(time.Second))
+}
+
+// credsTag names a credential in the log by the tail of its username — enough
+// to tell one from the next, not enough to use.
+func credsTag(user string) string {
+	if len(user) <= 4 {
+		return "…" + user
+	}
+	return "…" + user[len(user)-4:]
 }
 
 // fetchFunc is the raw credential retrieval function (no cache logic).
@@ -201,17 +274,15 @@ func getCredsCached(ctx context.Context, link string, streamID int, fn fetchFunc
 	cache.mutex.Lock()
 	defer cache.mutex.Unlock()
 
+	// A hit is not logged: every stream of the group takes one on every
+	// reconnect, and the dial line names the credential it got.
 	if cache.creds.Link == link && time.Now().Before(cache.creds.ExpiresAt) {
-		ttl := time.Until(cache.creds.ExpiresAt).Round(time.Second)
-		turnLog("[STREAM %d] Cache hit (cache=%d, ttl=%v)", streamID, cacheID, ttl)
 		return cache.creds.Username, cache.creds.Password, cache.creds.ServerAddrs, nil
 	}
 
 	if !cache.creds.FetchedAt.IsZero() {
-		lived := time.Since(cache.creds.FetchedAt).Round(time.Second)
-		expired := time.Since(cache.creds.ExpiresAt).Round(time.Second)
-		turnLog("[STREAM %d] Cache miss (cache=%d) — previous creds lived %v (expired %v ago), fetching...",
-			streamID, cacheID, lived, expired)
+		turnLog("[STREAM %d] Cache miss (cache=%d) — %s, fetching...",
+			streamID, cacheID, cacheMissReason(cache.creds, link, time.Now()))
 	} else {
 		turnLog("[STREAM %d] Cache miss (cache=%d), fetching...", streamID, cacheID)
 	}
@@ -226,7 +297,8 @@ func getCredsCached(ctx context.Context, link string, streamID int, fn fetchFunc
 		return "", "", nil, err
 	}
 
-	// Compute ExpiresAt from the real API lifetime; fall back to credentialLifetime.
+	// Compute ExpiresAt from the real API lifetime, else from the expiry VK
+	// stamps into the username; fall back to credentialLifetime.
 	expiry := time.Now().Add(credentialLifetime - cacheSafetyMargin)
 	if lifetimeSecs > int(cacheSafetyMargin.Seconds()) {
 		d := time.Duration(lifetimeSecs)*time.Second - cacheSafetyMargin
@@ -234,6 +306,8 @@ func getCredsCached(ctx context.Context, link string, streamID int, fn fetchFunc
 			d = time.Duration(defaultCycleSecs) * time.Second
 		}
 		expiry = time.Now().Add(d)
+	} else if until, ok := credentialExpiryFromUsername(user); ok {
+		expiry = credentialCacheExpiry(until, time.Now())
 	}
 
 	cache.creds = TurnCredentials{
@@ -244,7 +318,48 @@ func getCredsCached(ctx context.Context, link string, streamID int, fn fetchFunc
 		FetchedAt:   time.Now(),
 		Link:        link,
 	}
-	turnLog("[STREAM %d] Credentials cached until %v (cache=%d, api_ttl=%ds)",
-		streamID, cache.creds.ExpiresAt.Format("15:04:05"), cacheID, lifetimeSecs)
+	// A lifetime, not a wall-clock time: the line's own stamp already says when
+	// it was written, and a duration cannot disagree with it the way "until
+	// 04:55" on a line stamped 06:56 did on Android (Go formatting in UTC,
+	// logcat stamping in local time) — creds that read as expired hours ago.
+	turnLog("[STREAM %d] Credentials %s cached for %v (cache=%d, api_ttl=%ds)",
+		streamID, credsTag(user), time.Until(cache.creds.ExpiresAt).Round(time.Second), cacheID, lifetimeSecs)
 	return user, pass, addrs, nil
+}
+
+// credentialExpiryFromUsername reads the expiry VK's TURN REST service stamps
+// into the username: "<unix seconds>:<key id>" (draft-uberti-behave-turn-rest).
+// VK's JSON never reports a lifetime (api_ttl=0s in every log line), so this
+// stamp is the only statement VK makes about how long the credential lives —
+// typically hours, against the one-hour guess credentialLifetime falls back
+// to. Every hour shaved off a good credential is one more VK round trip, and
+// every VK round trip is captcha exposure. A username without the stamp, or
+// with an unparsable one, simply reports false and the fallback applies.
+func credentialExpiryFromUsername(username string) (time.Time, bool) {
+	stamp, _, found := strings.Cut(username, ":")
+	if !found || stamp == "" {
+		return time.Time{}, false
+	}
+	secs, err := strconv.ParseInt(stamp, 10, 64)
+	if err != nil || secs <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(secs, 0), true
+}
+
+// credentialCacheExpiry turns the stamped expiry into a cache deadline: the
+// stamp minus credentialExpiryBuffer, never beyond defaultCycleSecs, and never
+// before now. A stamp already inside the buffer is not a reason to refuse the
+// credential — the relay still takes it, and a 401 on the next attempt is the
+// cheap, bounded outcome the fallback TTL already accepts — so such a
+// credential is cached for the ordinary fallback lifetime instead.
+func credentialCacheExpiry(until, now time.Time) time.Time {
+	expiry := until.Add(-credentialExpiryBuffer)
+	if cap := now.Add(time.Duration(defaultCycleSecs) * time.Second); expiry.After(cap) {
+		expiry = cap
+	}
+	if !expiry.After(now) {
+		return now.Add(credentialLifetime - cacheSafetyMargin)
+	}
+	return expiry
 }

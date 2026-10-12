@@ -21,13 +21,14 @@ const (
 	idRefresh
 	idAutoConnect
 	idAutoRefresh
+	idCheckUpdate
 )
 
 // Stats are sampled off the window's message thread. Config keys and tokens
 // are never included in display text.
 type dashboardSnapshot struct {
 	status, hint, config, configNote, received, sent, total, session string
-	busy, canConnect, canDisconnect, refreshing                      bool
+	busy, canConnect, canDisconnect, refreshing, checkingUpdate      bool
 	settings                                                         winbridge.AppSettings
 }
 
@@ -50,7 +51,7 @@ func (a *App) dashboardSnapshot() dashboardSnapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s := dashboardSnapshot{settings: a.settings, busy: a.manager != nil || a.connecting || a.disconnecting,
-		canDisconnect: a.cancel != nil, refreshing: a.refreshing.Load()}
+		canDisconnect: a.cancel != nil, refreshing: a.refreshing.Load(), checkingUpdate: a.checkingUpdate.Load()}
 	s.canConnect = !s.busy && !s.refreshing && a.savedConfig != nil
 	s.status = "Отключено"
 	s.hint = "VPN направляет системный трафик по маршрутам конфига."
@@ -117,7 +118,8 @@ func (a *App) runDashboard() {
 	}
 
 	w.label("WgKeyBot", 24, 16, 350, 32, 1)
-	w.label("v"+Version, 480, 26, 156, 22, 0)
+	w.label("v"+Version, 380, 26, 90, 22, 0)
+	checkUpdate := w.add("BUTTON", "Проверить обновление", wsTabstop, idCheckUpdate, 470, 20, 166, 30, 0)
 	status := w.label("Отключено", 24, 58, 612, 28, 2)
 	w.add("BUTTON", "Режим подключения", bsGroupbox, 0, 24, 94, 612, 96, 0)
 	vpn := w.add("BUTTON", "&VPN", bsRadiobutton|wsTabstop|wsGroup, idVPN, 40, 116, 84, 26, 0)
@@ -165,6 +167,8 @@ func (a *App) runDashboard() {
 			action = a.doAutoConnectToggle
 		case idAutoRefresh:
 			action = a.doAutoRefreshToggle
+		case idCheckUpdate:
+			action = func() { go a.doCheckUpdate() }
 		}
 		if action != nil {
 			select {
@@ -193,6 +197,12 @@ func (a *App) runDashboard() {
 		refresh.enable(!s.refreshing && s.settings.AccessToken != "")
 		autoConnect.check(s.settings.AutoConnect)
 		autoRefresh.check(!s.settings.AutoRefreshDisabled)
+		checkUpdate.enable(!s.checkingUpdate)
+		if s.checkingUpdate {
+			checkUpdate.setText("Проверяем…")
+		} else {
+			checkUpdate.setText("Проверить обновление")
+		}
 		if s.refreshing {
 			refresh.setText("Обработка…")
 		} else {

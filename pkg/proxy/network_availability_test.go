@@ -9,6 +9,9 @@ import (
 func resetNetworkAvailabilityForTest() {
 	setNetworkAvailable(true)
 	resetNetworkPathProof()
+	networkAvailability.Lock()
+	networkAvailability.leftAt = time.Time{}
+	networkAvailability.Unlock()
 }
 
 func TestNetworkAvailabilityGateWaitsAndResumes(t *testing.T) {
@@ -97,6 +100,27 @@ func TestOldGenerationCannotRestorePathProof(t *testing.T) {
 	markNetworkPathProven(oldGeneration)
 	if isNetworkAvailable() {
 		t.Fatal("stale stream generation restored path proof")
+	}
+}
+
+// A network change clears what the old path proved, but the proxy's streams —
+// started before the change, and reconnecting on the new path under the same
+// token — must still be able to prove the new one.
+func TestNetworkChangeClearsProofButKeepsTheGeneration(t *testing.T) {
+	resetNetworkAvailabilityForTest()
+	defer resetNetworkAvailabilityForTest()
+
+	generation := beginNetworkPathGeneration()
+	setNetworkAvailable(false)
+	markNetworkPathProven(generation)
+
+	NotifyNetworkChange()
+	if isNetworkAvailable() {
+		t.Fatal("the old network's proof survived the change")
+	}
+	markNetworkPathProven(generation)
+	if !isNetworkAvailable() {
+		t.Fatal("a stream of the running proxy could not prove the new network")
 	}
 }
 

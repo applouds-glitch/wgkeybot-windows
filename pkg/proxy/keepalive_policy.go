@@ -143,16 +143,34 @@ func keepalivePhase(streamID, totalStreams int) time.Duration {
 type streamActivity struct {
 	lastRx atomic.Int64
 	phase  time.Duration
+
+	// lastHeard is lastRx without the freeze reset: the last packet that really
+	// arrived, or the session's start if none has. It is for the health
+	// accounting — how long the relay was silent — which the detector's clock
+	// cannot answer once resetLiveness has moved it.
+	lastHeard atomic.Int64
 }
 
 func newStreamActivity(now time.Time, phase time.Duration) *streamActivity {
 	a := &streamActivity{phase: phase}
 	a.lastRx.Store(now.UnixNano())
+	a.lastHeard.Store(now.UnixNano())
 	return a
 }
 
 func (a *streamActivity) noteRx(now time.Time) {
 	a.lastRx.Store(now.UnixNano())
+	a.lastHeard.Store(now.UnixNano())
+}
+
+// heardAge is how long ago the relay was last really heard — since the session
+// began, if it never was.
+func (a *streamActivity) heardAge(now time.Time) time.Duration {
+	age := now.Sub(atomicTimestamp(&a.lastHeard))
+	if age < 0 {
+		return 0
+	}
+	return age
 }
 
 // resetLiveness restarts the liveness clock without inbound evidence. Only the

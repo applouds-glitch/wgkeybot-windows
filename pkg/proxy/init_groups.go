@@ -190,7 +190,7 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 				defer groupsWg.Done()
 				WorkerGroup(gCtx, groupCfg, groupStreams)
 			}()
-			turnLog("[INIT] Group %d started (link=%.12s, streams %d-%d)", gi, link, start, end-1)
+			turnLog("[INIT] Group %d started (streams %d-%d)", gi, start, end-1)
 		}
 	}()
 

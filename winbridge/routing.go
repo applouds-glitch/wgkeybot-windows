@@ -1,10 +1,12 @@
 package winbridge
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
 	"strconv"
+	"sync"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -15,12 +17,21 @@ import (
 // шлюз по умолчанию и добавляем явные host-маршруты для TURN-серверов
 // через этот шлюз. После остановки тоннеля — удаляем их.
 //
+// Маршруты ставятся не только пачкой до AllowedIPs, но и по требованию:
+// прокси перед каждым дозвоном (TURN, VK, DNS, капча) зовёт EnsureBypassRoute
+// (proxy.BypassRouter), так что адрес, узнанный уже под поднятым VPN — релей
+// новых кредов, следующая A-запись VK, хост виджета капчи — тоже уходит в
+// физический интерфейс, а не в туннель. Смена шлюза (Refresh) переносит все
+// поставленные маршруты на новый.
+//
 // Вся работа идёт через IP Helper API (winipcfg), без запуска netsh/route —
 // спавн внешних процессов из админ-процесса повышает heuristic-score антивируса.
 type RouteManager struct {
-	physLUID   winipcfg.LUID // LUID физического интерфейса с дефолтным маршрутом
-	physGW     netip.Addr    // IP шлюза физической сети
-	turnRoutes []netip.Addr  // добавленные TURN host-маршруты (для отката)
+	mu       sync.Mutex
+	physLUID winipcfg.LUID // LUID физического интерфейса с дефолтным маршрутом
+	physGW   netip.Addr    // IP шлюза физической сети
+	owned    map[netip.Addr]struct{}
+	order    []netip.Addr // owned в порядке добавления (для журнала и отката)
 }
 
 // NewRouteManager создаёт RouteManager, определяя текущий дефолтный шлюз.
@@ -30,43 +41,119 @@ func NewRouteManager() (*RouteManager, error) {
 		return nil, fmt.Errorf("cannot find default gateway: %w", err)
 	}
 	log.Printf("[ROUTE] Physical gateway: %s via ifindex %d", gw, ifIndex)
-	return &RouteManager{physLUID: luid, physGW: gw}, nil
+	return &RouteManager{physLUID: luid, physGW: gw, owned: map[netip.Addr]struct{}{}}, nil
 }
 
-// AddTURNRoutes добавляет явные host-маршруты для TURN-серверов через
-// физический шлюз. Вызывается ПЕРЕД поднятием WireGuard-интерфейса.
+// EnsureBypassRoute ставит host-маршрут до ip через физический шлюз, если его
+// ещё нет. Реализует proxy.BypassRouter: прокси зовёт это перед каждым
+// дозвоном, ошибка означает «не дозваниваться» — иначе пакет уйдёт в туннель.
+//
+// Приватные, link-local и прочие неглобальные адреса не трогаются: DNS-сервер
+// в локальной сети и так on-link, а /32 через шлюз увёл бы трафик к нему
+// кружным путём. Адрес другого семейства, чем шлюз, тоже оставляется как есть —
+// маршрутизировать его не через что.
+func (r *RouteManager) EnsureBypassRoute(ipStr string) error {
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return fmt.Errorf("bypass route: %q is not an IP", ipStr)
+	}
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.owned[ip]; ok {
+		return nil
+	}
+	if ip.Is4() != r.physGW.Is4() {
+		log.Printf("[ROUTE] Skipping %s: address family differs from gateway %s", ip, r.physGW)
+		return nil
+	}
+	if err := r.addLocked(ip); err != nil {
+		return err
+	}
+	r.owned[ip] = struct{}{}
+	r.order = append(r.order, ip)
+	return nil
+}
+
+// addLocked ставит /32 (или /128) до ip через текущий шлюз. Уже существующий
+// маршрут — например, оставшийся от аварийно завершённого процесса — считается
+// нашим: он ведёт туда же, а Cleanup его снимет.
+func (r *RouteManager) addLocked(ip netip.Addr) error {
+	dst := netip.PrefixFrom(ip, ip.BitLen())
+	err := r.physLUID.AddRoute(dst, r.physGW, 0)
+	switch {
+	case err == nil:
+		log.Printf("[ROUTE] Added bypass route: %s via %s", dst, r.physGW)
+	case errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS):
+		log.Printf("[ROUTE] Bypass route %s via %s already present — adopted", dst, r.physGW)
+	default:
+		return fmt.Errorf("add route %s via %s: %w", dst, r.physGW, err)
+	}
+	return nil
+}
+
+// AddTURNRoutes добавляет host-маршруты для списка адресов через физический
+// шлюз (пачка до поднятия WireGuard-интерфейса). Отказ по одному адресу не
+// останавливает остальные — он попадёт в журнал, а прокси спросит маршрут ещё
+// раз перед дозвоном.
 func (r *RouteManager) AddTURNRoutes(turnServerIPs []string) {
 	for _, ipStr := range turnServerIPs {
-		ip, err := netip.ParseAddr(ipStr)
-		if err != nil {
-			log.Printf("[ROUTE] Skipping non-IP: %s", ipStr)
-			continue
+		if err := r.EnsureBypassRoute(ipStr); err != nil {
+			log.Printf("[ROUTE] Warning: %v", err)
 		}
-		if ip.Is4() != r.physGW.Is4() {
-			log.Printf("[ROUTE] Skipping %s: address family differs from gateway %s", ip, r.physGW)
-			continue
-		}
-		dst := netip.PrefixFrom(ip, ip.BitLen()) // /32 или /128
-		if err := r.physLUID.AddRoute(dst, r.physGW, 0); err != nil {
-			log.Printf("[ROUTE] Warning: cannot add route for %s: %v", ip, err)
-			continue
-		}
-		r.turnRoutes = append(r.turnRoutes, ip)
-		log.Printf("[ROUTE] Added TURN route: %s via %s", dst, r.physGW)
 	}
 }
 
-// Cleanup удаляет добавленные TURN host-маршруты.
+// Refresh перечитывает дефолтный маршрут и, если шлюз или интерфейс сменились,
+// переносит все поставленные host-маршруты на новые: маршрут через исчезнувший
+// шлюз неактивен, и трафик к релеям падал бы в 0.0.0.0/0 туннеля. Возвращает
+// true, если перенос был.
+func (r *RouteManager) Refresh() bool {
+	gw, luid, ifIndex, err := defaultRoute()
+	if err != nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if gw == r.physGW && luid == r.physLUID {
+		return false
+	}
+	log.Printf("[ROUTE] Physical gateway changed: %s -> %s (ifindex %d), re-homing %d bypass route(s)", r.physGW, gw, ifIndex, len(r.order))
+	for _, ip := range r.order {
+		dst := netip.PrefixFrom(ip, ip.BitLen())
+		if err := r.physLUID.DeleteRoute(dst, r.physGW); err != nil {
+			log.Printf("[ROUTE] Warning: cannot remove route for %s via old gateway: %v", ip, err)
+		}
+	}
+	r.physGW, r.physLUID = gw, luid
+	for _, ip := range r.order {
+		if ip.Is4() != r.physGW.Is4() {
+			continue
+		}
+		if err := r.addLocked(ip); err != nil {
+			log.Printf("[ROUTE] Warning: %v", err)
+		}
+	}
+	return true
+}
+
+// Cleanup удаляет добавленные host-маршруты.
 func (r *RouteManager) Cleanup() {
-	for _, ip := range r.turnRoutes {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ip := range r.order {
 		dst := netip.PrefixFrom(ip, ip.BitLen())
 		if err := r.physLUID.DeleteRoute(dst, r.physGW); err != nil {
 			log.Printf("[ROUTE] Warning: cannot remove route for %s: %v", ip, err)
 		} else {
-			log.Printf("[ROUTE] Removed TURN route: %s", dst)
+			log.Printf("[ROUTE] Removed bypass route: %s", dst)
 		}
 	}
-	r.turnRoutes = nil
+	r.order = nil
+	r.owned = map[netip.Addr]struct{}{}
 }
 
 // SetupInterface назначает IP-адреса и DNS wintun-интерфейсу через IP Helper API.

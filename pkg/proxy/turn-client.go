@@ -49,7 +49,11 @@ func clearTransientState() {
 // WorkerGroup re-fetches creds only if its streams actually fail after the
 // change, so a healthy session survives a network switch.
 func NotifyNetworkChange() {
-	resetNetworkPathProof()
+	// First, so that no retry heads for a relay the allocations left on the old
+	// network fill (orphaned_allocations.go).
+	orphanLiveAllocations(time.Now())
+	noteNetworkLeft()
+	clearNetworkPathProof()
 	ClearCache()
 	turnLog("[NETWORK] Network change: path proof and DNS cache reset (creds preserved)")
 }
@@ -154,6 +158,17 @@ func (s *stream) dispatchStale(now time.Time) bool {
 
 const iPacketBuffMaxSize = 2048
 
+// deadStreamError ends a session whose relay has been silent for
+// deadStreamTimeout. It carries the length of the silence, which the health
+// accounting takes off the session's length (see sessionOutcome).
+type deadStreamError struct {
+	silent time.Duration
+}
+
+func (e *deadStreamError) Error() string {
+	return fmt.Sprintf("dead-stream: no RX for %v", e.silent.Round(time.Second))
+}
+
 // runKeepalive is the single per-stream NAT-hold and liveness loop shared by
 // all transports. Connections are established with a safety stagger, but every
 // ready stream sends its normal keepalive on the same 25s wall-clock grid so the
@@ -200,7 +215,9 @@ func (s *stream) runKeepalive(ctx context.Context, activity *streamActivity, rep
 
 		if rxAge >= deadStreamTimeout {
 			turnLog("[STREAM %d] dead-stream detector: no RX for %v — closing", s.id, rxAge.Round(time.Second))
-			reportErr(fmt.Errorf("dead-stream: no RX for %v", rxAge.Round(time.Second)))
+			// heardAge, not rxAge: a freeze reset restarts the detector's clock,
+			// not the silence the relay is answerable for.
+			reportErr(&deadStreamError{silent: activity.heardAge(now)})
 			return
 		}
 		// An RX that arrived after the timer was armed may make an old liveness
@@ -335,7 +352,6 @@ func (s *stream) runNoDTLS(ctx context.Context, relayConn net.PacketConn, peer *
 	}
 
 	hasWrap := s.wrapKey != nil
-	turnLog("[STREAM %d] NoDTLS mode (wrap=%v) — %s", s.id, hasWrap, peer)
 
 	// Closed by the RX goroutine on the first packet the relay hands back that
 	// survives the peer and WRAP checks. That packet is the whole proof this
@@ -356,7 +372,6 @@ func (s *stream) runNoDTLS(ctx context.Context, relayConn net.PacketConn, peer *
 		if hErr := s.sendSessionHSBurst(relayConn, peer, sessionHS, hasWrap); hErr != nil {
 			return fmt.Errorf("%w: %w", errDataPlaneHandshake, hErr)
 		}
-		turnLog("[STREAM %d] Session handshake burst sent", s.id)
 	}
 
 	// Cancelling sCtx (watchdog, error, parent stop) closes the relay conn so
@@ -770,7 +785,6 @@ func (s *stream) runDTLS(ctx context.Context, relayConn net.PacketConn, peer *ne
 		}
 	}()
 
-	turnLog("[STREAM %d] DTLS handshake...", s.id)
 	// The handshake FSM watches this context between flights, so the timeout
 	// cuts a blackholed relay off at dataPlaneHandshakeTimeout wherever it is
 	// in the retransmit schedule.
@@ -925,7 +939,6 @@ func (s *stream) runSRTP(ctx context.Context, relayConn net.PacketConn, peer *ne
 	// relay on ctx cancel unblocks it so the session tears down cleanly.
 	context.AfterFunc(sCtx, func() { relayConn.Close() })
 
-	turnLog("[STREAM %d] SRTP handshake...", s.id)
 	hsCtx, hsCancel := context.WithTimeout(sCtx, dataPlaneHandshakeTimeout)
 	srtpConn, err := srtpwrap.Client(hsCtx, relayConn, peer)
 	hsCancel()
@@ -1054,6 +1067,11 @@ func (s *stream) runSRTP(ctx context.Context, relayConn net.PacketConn, peer *ne
 
 var currentTurnCancel context.CancelFunc
 var currentTurnDone <-chan struct{}
+
+// currentListener — loopback-слушатель текущего поколения прокси. StopProxy
+// закрывает его синхронно, чтобы перезапуск транспорта (Tunnel.RestartTransport)
+// мог занять тот же порт — WireGuard продолжает слать на него.
+var currentListener net.PacketConn
 var turnMutex sync.Mutex
 var globalGetCreds getCredsFunc
 
@@ -1100,12 +1118,23 @@ func parseLinks(raw string, maxLinks int) []string {
 
 // StartProxyParams — параметры для StartProxy.
 type StartProxyParams struct {
-	PeerAddr        string // WireGuard peer endpoint (host:port)
-	VKLink          string // VK link(s), comma- или pipe-separated
-	Mode            string // "dtls" | "nodtls"
-	StreamNum       int    // желаемое общее количество стримов
-	UseUDP          bool
-	ListenAddr      string // loopback listener (например 127.0.0.1:0)
+	PeerAddr   string // WireGuard peer endpoint (host:port)
+	VKLink     string // VK link(s), comma- или pipe-separated
+	Mode       string // "dtls" | "nodtls"
+	StreamNum  int    // желаемое общее количество стримов
+	UseUDP     bool
+	ListenAddr string // loopback listener (например 127.0.0.1:0)
+	// Parent — контекст поколения прокси. Его отмена останавливает старт даже
+	// раньше, чем StartProxy зарегистрировал свой cancel: Tunnel.Stop во время
+	// перезапуска транспорта не оставляет прокси-сироту. nil — Background.
+	Parent context.Context
+	// OnListen получает фактический адрес слушателя (порт :0 разрешён ОС) до
+	// пре-фетча кредов — так капча и WireGuard видят настоящий порт.
+	OnListen func(addr string)
+	// KeepDNSCache — не сбрасывать DNS-кеш при старте: перезапуск транспорта
+	// идёт под поднятым VPN, где у старых адресов уже есть bypass-маршруты, а
+	// новый резолв через публичный резолвер ушёл бы в мёртвый туннель.
+	KeepDNSCache    bool
 	TurnIP          string // pre-resolved TURN server IP
 	TurnPort        int
 	PeerType        string // "VK" | "WB"
@@ -1120,7 +1149,13 @@ type StartProxyParams struct {
 // (звонок завершён/удалён или ссылка недействительна — ретраи бессмысленны).
 func StartProxy(p StartProxyParams) int32 {
 	networkGeneration := beginNetworkPathGeneration()
-	clearTransientState() // flush DNS + HTTP without clearing credential caches
+	if !p.KeepDNSCache {
+		clearTransientState() // flush DNS + HTTP without clearing credential caches
+	}
+	parent := p.Parent
+	if parent == nil {
+		parent = context.Background()
+	}
 
 	if len(p.SystemDNS) > 0 {
 		InitSystemDns(p.SystemDNS)
@@ -1154,7 +1189,13 @@ func StartProxy(p StartProxyParams) int32 {
 	if currentTurnCancel != nil {
 		currentTurnCancel()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	// The previous generation's listener goes now, not when its context's
+	// AfterFunc gets to it: this start may bind the same port.
+	if currentListener != nil {
+		currentListener.Close()
+		currentListener = nil
+	}
+	ctx, cancel := context.WithCancel(parent)
 	currentTurnCancel = cancel
 	turnMutex.Unlock()
 
@@ -1221,9 +1262,10 @@ func StartProxy(p StartProxyParams) int32 {
 	}
 	setStreamsPerCred(streamsPerGroup)
 
-	turnLog("[PROXY] Starting: listen=%s StreamNum=%d streamsPerGroup=%d links=%d actualTotal=%d mode=%s peerType=%s watchdog=%ds",
-		listenAddr, p.StreamNum, streamsPerGroup, len(links), totalStreams, mode, peerType, watchdogTimeout)
-	turnLog("[PROXY] Identities (%d): %v", len(links), links)
+	// Peer and WRAP are said once here rather than on every stream session:
+	// they cannot change until the next start.
+	turnLog("[PROXY] Starting: listen=%s StreamNum=%d streamsPerGroup=%d links=%d actualTotal=%d mode=%s peerType=%s peer=%s wrap=%v watchdog=%ds",
+		listenAddr, p.StreamNum, streamsPerGroup, len(links), totalStreams, mode, peerType, p.PeerAddr, wrapKey != nil, watchdogTimeout)
 
 	// ── DNS resolution ────────────────────────────────────────────────────────
 	peer, err := resolvePeer(p.PeerAddr)
@@ -1239,6 +1281,12 @@ func StartProxy(p StartProxyParams) int32 {
 		return -1
 	}
 	context.AfterFunc(ctx, func() { lc.Close() })
+	turnMutex.Lock()
+	currentListener = lc
+	turnMutex.Unlock()
+	if p.OnListen != nil {
+		p.OnListen(lc.LocalAddr().String())
+	}
 
 	sessionID, _ := uuid.New().MarshalBinary()
 	cert, err := selfsign.GenerateSelfSigned()
@@ -1358,8 +1406,10 @@ func StopProxy() {
 	turnMutex.Lock()
 	cancel := currentTurnCancel
 	done := currentTurnDone
+	lc := currentListener
 	currentTurnCancel = nil
 	currentTurnDone = nil
+	currentListener = nil
 	turnMutex.Unlock()
 
 	if cancel != nil {
@@ -1377,6 +1427,11 @@ func StopProxy() {
 				turnLog("[PROXY] Stop: allocation drain timed out")
 			}
 		}
+	}
+	// Synchronously, so the port is free by the time this returns: a transport
+	// rebuild binds it again at once.
+	if lc != nil {
+		lc.Close()
 	}
 	// Credential caches are intentionally preserved across stops so an immediate
 	// reconnect gets a cache hit and avoids a fresh VK API round-trip (and captcha).
