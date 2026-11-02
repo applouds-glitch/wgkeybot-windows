@@ -39,6 +39,10 @@ var networkAvailability = struct {
 	unvalidatedProbeID   uint64
 	becameAvailable      chan struct{}
 
+	// epoch counts the host's reports of the network gone or exchanged for
+	// another: the network a session ran on, for the counts that are per
+	// network (relay_deaf.go).
+	epoch uint64
 	// leftAt is when the host last reported the network gone or exchanged for
 	// another — what networkLeftSince measures an attempt against.
 	leftAt time.Time
@@ -56,8 +60,10 @@ func signalNetworkWaitersLocked() {
 	networkAvailability.becameAvailable = make(chan struct{})
 }
 
-// setNetworkAvailable updates Android's NET_CAPABILITY_VALIDATED signal. A
-// false value does not erase fresh proof obtained from the TURN transport.
+// setNetworkAvailable updates the host's signal — on Windows, whether there is
+// a physical default gateway. Its loss (true → false) also clears the proof the
+// streams gathered: see below. A false that only repeats leaves fresh proof
+// alone.
 func setNetworkAvailable(validated bool) {
 	networkAvailability.Lock()
 	defer networkAvailability.Unlock()
@@ -67,6 +73,21 @@ func setNetworkAvailable(validated bool) {
 	left := networkAvailability.androidValidated && !validated
 	if left {
 		networkAvailability.leftAt = now
+		networkAvailability.epoch++
+		// Windows: the host's "no network" is the physical gateway gone, not
+		// Android's validation lost — a fact about the path, and what the streams
+		// proved over it says no more. Kept, the proof held the gate open for up
+		// to transportPathProofTTL over a route that no longer existed: credential
+		// fetches and Allocates on nothing, their failures aging the backoff
+		// streaks the gate is there to spare (Codex review 24.10). Only the
+		// transition clears it: a host that never saw a gateway — an on-link
+		// default route (PPPoE, a mobile modem) that DefaultGateway does not
+		// count — keeps the proof and the probe as its way back. Android dropped
+		// both (3e41dc8c), its host signal being the physical network itself.
+		networkAvailability.transportProvenUntil = time.Time{}
+		networkAvailability.nextUnvalidatedProbe = time.Time{}
+		networkAvailability.unvalidatedProbeBusy = false
+		networkAvailability.unvalidatedProbeID++
 	}
 	networkAvailability.androidValidated = validated
 	if validated {
@@ -148,7 +169,17 @@ func clearNetworkPathProof() {
 func noteNetworkLeft() {
 	networkAvailability.Lock()
 	networkAvailability.leftAt = time.Now()
+	networkAvailability.epoch++
 	networkAvailability.Unlock()
+}
+
+// networkEpoch is the network in use, as the count of the host's reports of
+// one left: it moves with every loss or exchange (setNetworkAvailable,
+// noteNetworkLeft).
+func networkEpoch() uint64 {
+	networkAvailability.Lock()
+	defer networkAvailability.Unlock()
+	return networkAvailability.epoch
 }
 
 // networkLeftSince reports whether the host says there is no network now, or
@@ -243,6 +274,20 @@ func waitForNetworkPermit(ctx context.Context, allowUnvalidatedProbe bool) (netw
 			return networkPermit{}, false
 		}
 	}
+}
+
+// networkPermitCurrent reports whether permit still lets its worker dial: any
+// permit while the gate is open, a probe's only while it is the probe in force.
+// A probe voided since — the gateway lost or back, the path proven or changed —
+// must not dial beside the one issued after it (Codex review 24.10).
+func networkPermitCurrent(permit networkPermit) bool {
+	networkAvailability.Lock()
+	defer networkAvailability.Unlock()
+	if networkAvailableLocked(time.Now()) {
+		return true
+	}
+	return permit.unvalidatedProbe && networkAvailability.unvalidatedProbeBusy &&
+		permit.probeID == networkAvailability.unvalidatedProbeID
 }
 
 func releaseNetworkPermit(permit networkPermit) {

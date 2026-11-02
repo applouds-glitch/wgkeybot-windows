@@ -18,3 +18,14 @@ var localNetworkErrnos = []syscall.Errno{
 	syscall.EADDRNOTAVAIL, // the source address left with the lease
 	syscall.EPERM,         // the platform's firewall cut the socket off
 }
+
+// The relay's answers a socket reports, and the silences it times out on
+// (relay_silence.go).
+var (
+	relayRefusedErrnos  = []syscall.Errno{syscall.ECONNREFUSED}
+	relayResetErrnos    = []syscall.Errno{syscall.ECONNRESET, syscall.EPIPE}
+	relayTimedOutErrnos = []syscall.Errno{syscall.ETIMEDOUT}
+	// relayFlowGaveUpErrnos: a TCP connection to a relay the kernel gave up
+	// (relayFlowConn, relayTCPUserTimeout).
+	relayFlowGaveUpErrnos = []syscall.Errno{syscall.ETIMEDOUT}
+)

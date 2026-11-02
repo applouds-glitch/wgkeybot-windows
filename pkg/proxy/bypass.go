@@ -7,6 +7,8 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -38,6 +40,13 @@ var (
 	bypassMu     sync.RWMutex
 	bypassRouter BypassRouter
 )
+
+// errBypassRoute marks a dial the router would not route outside the tunnel:
+// the route could not be added (the gateway's interface went away under it) or
+// the address is kept inside on purpose. It is the machine's side, never the
+// far end's — the Windows counterpart of Android's protect() refusal, and read
+// the same way (ownNetworkFailure).
+var errBypassRoute = errors.New("no route outside the tunnel")
 
 // SetBypassRouter installs the router the dials consult; nil removes it.
 func SetBypassRouter(r BypassRouter) {
@@ -73,7 +82,10 @@ func ensureBypass(addr string) error {
 	if net.ParseIP(host) == nil {
 		return nil
 	}
-	return r.EnsureBypassRoute(host)
+	if err := r.EnsureBypassRoute(host); err != nil {
+		return fmt.Errorf("%w: %w", errBypassRoute, err)
+	}
+	return nil
 }
 
 // DialOutsideTunnel is a DialContext for hosts that must be reached over the

@@ -22,6 +22,7 @@ const (
 	idAutoConnect
 	idAutoRefresh
 	idCheckUpdate
+	idExpert
 )
 
 // Stats are sampled off the window's message thread. Config keys and tokens
@@ -65,9 +66,15 @@ func (a *App) dashboardSnapshot() dashboardSnapshot {
 		s.status = "Подключение…"
 	} else if a.manager != nil && a.stats.Connected {
 		s.status = "Подключено"
-		if a.stats.LastHandshake.IsZero() {
+		switch {
+		case a.stats.LastHandshake.IsZero():
 			s.status = "Ожидание ответа WireGuard…"
-		} else if time.Since(a.stats.LastHandshake) > 3*time.Minute {
+		case a.stats.RelaysSilent():
+			// Сеть есть, а релеи по ней молчат: виновата сеть до релеев, не
+			// туннель (winbridge.TunnelStats.RelaysSilent).
+			s.status = "Релеи не отвечают"
+			s.hint = "Сеть подключена, но релеи по ней не отвечают. Продолжаем попытки — подключимся, как только ответят."
+		case time.Since(a.stats.LastHandshake) > 3*time.Minute:
 			s.status = "Восстановление связи…"
 		}
 		s.session = "В сети: " + formatDuration(time.Since(a.connectedAt)) + " · трафик текущего соединения"
@@ -81,6 +88,12 @@ func (a *App) dashboardSnapshot() dashboardSnapshot {
 	if a.manager != nil && a.cfg != nil {
 		cfg = a.cfg
 		s.configNote = "Активный конфиг"
+		if a.expertActive {
+			s.configNote += " · режим эксперта"
+		}
+		if winbridge.RelaysOverTCP(a.cfg) {
+			s.configNote += " · до релеев по TCP"
+		}
 		if a.activeConfigHash != a.settings.LastConfigHash {
 			s.configNote += " · есть обновление для следующего подключения"
 		}
@@ -140,6 +153,7 @@ func (a *App) runDashboard() {
 	config := w.add("EDIT", "", 0x00800000|0x00200000|0x0800|0x0004|0x0040|wsTabstop, 0, 24, 342, 612, 98, 0)
 	importButton := w.add("BUTTON", "&Импорт токена…", wsTabstop, idImport, 24, 452, 178, 32, 0)
 	refresh := w.add("BUTTON", "Обновить конфиг", wsTabstop, idRefresh, 212, 452, 178, 32, 0)
+	w.add("BUTTON", "Режим эксперта…", wsTabstop, idExpert, 400, 452, 236, 32, 0)
 	autoConnect := w.add("BUTTON", "Подключаться при запуске", bsCheckbox|wsTabstop, idAutoConnect, 24, 490, 292, 26, 0)
 	autoRefresh := w.add("BUTTON", "Автообновление конфига", bsCheckbox|wsTabstop, idAutoRefresh, 338, 490, 298, 26, 0)
 	w.label("Закрытие окна сворачивает приложение в трей. Выход — через меню трея.", 24, 524, 612, 22, 0)
@@ -169,6 +183,8 @@ func (a *App) runDashboard() {
 			action = a.doAutoRefreshToggle
 		case idCheckUpdate:
 			action = func() { go a.doCheckUpdate() }
+		case idExpert:
+			action = a.openExpert
 		}
 		if action != nil {
 			select {

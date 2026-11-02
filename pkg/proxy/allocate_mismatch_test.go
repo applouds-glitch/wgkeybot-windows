@@ -104,7 +104,7 @@ func TestInitialAllocateErrorKeepsActualCode(t *testing.T) {
 			pc, _ := startInitialRefusalServer(t, 100, code)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", pc.LocalAddr().String(), WorkerGroupConfig{UseUDP: true})
+			_, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", pc.LocalAddr().String(), WorkerGroupConfig{UseUDP: true}, dialOpts{})
 			if got, ok := turnErrorCode(err); !ok || got != code {
 				t.Fatalf("want %d, got %v", code, err)
 			}
@@ -135,7 +135,7 @@ func TestQuotaRefusalIsNotAServerFailure(t *testing.T) {
 			addr := pc.LocalAddr().String()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			if _, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", addr, WorkerGroupConfig{UseUDP: true}); err == nil {
+			if _, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", addr, WorkerGroupConfig{UseUDP: true}, dialOpts{}); err == nil {
 				t.Fatal("refused Allocate succeeded")
 			}
 
@@ -150,14 +150,25 @@ func TestQuotaRefusalIsNotAServerFailure(t *testing.T) {
 	}
 }
 
-// 437 rotates the credential, as it always has: the refusal now arrives with
-// its code instead of as a missing attribute, and both classify the same way.
-func TestAllocateMismatchRotatesCredentials(t *testing.T) {
+// 437 does not rotate the credential any more. iOS field log 2026-09-28
+// 12:58: a fresh socket's Allocate was answered 437, the credential was
+// rotated, and the fresh credential got the same 437 on both relays — the
+// 5-tuple was the problem (a port the translator reused for an allocation out
+// of reach), and the worker's next socket succeeded. The refusal still arrives
+// with its code (allocateResponseConn), it is just not the credential's fault,
+// nor the relay's.
+func TestAllocateMismatchIsNotTheCredentialsFault(t *testing.T) {
 	pc, _ := startInitialRefusalServer(t, 100, stun.CodeAllocMismatch)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", pc.LocalAddr().String(), WorkerGroupConfig{UseUDP: true})
-	if !classifyCredError(err) || isQuotaError(err) {
-		t.Fatalf("437 should rotate the credential without the quota cooldown: %v", err)
+	_, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", pc.LocalAddr().String(), WorkerGroupConfig{UseUDP: true}, dialOpts{})
+	if !isAllocateMismatch(err) {
+		t.Fatalf("the refusal lost its code: %v", err)
+	}
+	if classifyCredError(err) || isQuotaError(err) {
+		t.Fatalf("437 must not rotate the credential: %v", err)
+	}
+	if serverPenalized(pc.LocalAddr().String(), time.Now()) {
+		t.Fatal("437 was held against the relay")
 	}
 }

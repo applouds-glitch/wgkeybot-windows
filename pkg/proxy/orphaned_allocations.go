@@ -6,6 +6,7 @@
 package proxy
 
 import (
+	"errors"
 	"math/rand"
 	"net"
 	"sync"
@@ -15,8 +16,8 @@ import (
 // Allocations orphaned by a lost network.
 //
 // VK allows about ten simultaneous allocations per (credential, relay), and a
-// session puts all of its streams on one relay, so the pair is full while the
-// session lives. When the physical network the session's sockets are bound to
+// session then put all of its streams on one relay, so the pair was full while
+// the session lived. When the physical network the session's sockets are bound to
 // goes away, none of them can send the Refresh(0) that would release their
 // allocation: the relay keeps all of them for the allocation lifetime while
 // nobody holds them. Every reconnect on the same credential then opened with a
@@ -26,11 +27,14 @@ import (
 // which cost a fresh credential from VK.
 //
 // Such a (credential, relay) is marked orphaned for the allocation lifetime,
-// and attempts on that credential try its other relays first. Only the order
-// changes — an orphaned relay stays in the list, last — so a mark can never make
-// a working relay unreachable; if the others fail, the orphaned one is still
-// dialed and answers for itself. Two events mark it, each covering what the
-// other cannot see:
+// with a count of the ghosts it holds, and once they fill half the quota
+// (orphanSteerAt) attempts on that credential try its other relays first. Only
+// the order changes — a crowded relay stays in the list, last — so a mark can
+// never make a working relay unreachable; if the others fail, the crowded one is
+// still dialed and answers for itself. Three events mark it, each covering what
+// the others cannot see — and each allocation counts once under a mark,
+// whichever reports it first (trackedRelay.ghostOf); a later report only
+// extends the mark, and under a mark that has run out it counts again:
 //
 //   - a close whose Refresh(0) did not leave the socket. pion sends it once,
 //     without waiting, and returns the write error from Close, so that error is
@@ -43,12 +47,25 @@ import (
 //     physical default gateway lost or exchanged for another
 //     (orphanLiveAllocations, from the host's signals) — for every allocation
 //     still live at that moment. Their release may yet be "sent" into a link
-//     that is gone without a write error (carrier lost, route not yet removed).
+//     that is gone without a write error (carrier lost, route not yet removed);
+//   - a session that ended out of the relay's reach (noteOutOfReach).
 //
 // A release that went out on a live network is not marked: VK frees those
 // (confirmed on the device the same day). The book outlives the proxy session
 // on purpose: credentials are kept across a stop and a reconnect (StopProxy),
 // so the quota they hold on a relay is still theirs to trip over.
+//
+// Half the quota, not one ghost: since 2026-10-10 a session spreads its streams
+// over the relays (assignRelays), so a loss leaves one to four ghosts on each
+// relay instead of ten on one. Steering around every marked relay then piled
+// the streams up on the relays left — Android periodic-download run on 18.10: a
+// two-minute dark at 21:16 left one to four ghosts on five relays, and 8 of the
+// 10 streams came back on the sixth; the dark at 21:30 left eight on one relay
+// and one each on two more, and 5 came back on one of the three left, the order
+// rotated over all six before the marked ones were moved out of it
+// (assignRelaysAround). Streams that did land among a few ghosts drew no 486 in
+// that run or the one before. A key's ghosts all expire with the newest of
+// them.
 
 // orphanedAllocationLifetime is how long VK keeps an allocation whose client is
 // gone: its lifetime, counted from its last refresh. When that refresh happened
@@ -86,14 +103,23 @@ type relayIdentity struct {
 var allocationBook = struct {
 	sync.Mutex
 	live         map[relayIdentity]int
+	tracked      map[*trackedRelay]bool // the allocations live now, for the network trigger
 	orphanedTill map[relayIdentity]time.Time
+	orphans      map[relayIdentity]int       // the ghosts counted under the mark in force
+	markOf       map[relayIdentity]uint64    // the mark in force, by number (lastMark)
+	lastMark     uint64                      // the number of the newest mark on any key
 	announced    map[relayIdentity]bool      // this mark has already been logged as steering a dial
 	releasedAt   map[relayIdentity]time.Time // when our latest release there went out
+	succeeded    map[string]bool             // credentials at least one allocation was ever accepted on (quota_breaker.go)
 }{
 	live:         map[relayIdentity]int{},
+	tracked:      map[*trackedRelay]bool{},
 	orphanedTill: map[relayIdentity]time.Time{},
+	orphans:      map[relayIdentity]int{},
+	markOf:       map[relayIdentity]uint64{},
 	announced:    map[relayIdentity]bool{},
 	releasedAt:   map[relayIdentity]time.Time{},
+	succeeded:    map[string]bool{},
 }
 
 // trackedRelay counts one live allocation until it is closed. The relay conn is
@@ -106,14 +132,37 @@ type trackedRelay struct {
 	key    relayIdentity
 	mu     sync.Mutex
 	closed bool
+
+	// ghostOf is the mark this allocation was counted under as a ghost on key,
+	// 0 if none. Guarded by allocationBook.
+	ghostOf uint64
 }
 
 func trackAllocation(relay net.PacketConn, user, addr string) net.PacketConn {
 	key := relayIdentity{user: user, relay: addr}
+	r := &trackedRelay{PacketConn: relay, key: key}
 	allocationBook.Lock()
 	allocationBook.live[key]++
+	allocationBook.tracked[r] = true
+	allocationBook.succeeded[user] = true
 	allocationBook.Unlock()
-	return &trackedRelay{PacketConn: relay, key: key}
+	return r
+}
+
+// trackedAllocation finds the allocation under a session's relay conn: the
+// trackedRelay itself, or beneath the close budget over TCP (boundRelayClose);
+// nil for a conn that is none.
+func trackedAllocation(pc net.PacketConn) *trackedRelay {
+	for {
+		switch c := pc.(type) {
+		case *trackedRelay:
+			return c
+		case *boundedCloseRelay:
+			pc = c.PacketConn
+		default:
+			return nil
+		}
+	}
 }
 
 func (r *trackedRelay) Close() error {
@@ -124,48 +173,146 @@ func (r *trackedRelay) Close() error {
 	}
 	r.closed = true
 	err := r.PacketConn.Close()
-	releaseAllocation(r.key, err, time.Now())
+	releaseAllocation(r.key, err, time.Now(), r)
 	return err
 }
 
 // releaseAllocation drops one live allocation from the count; unreleased is the
-// error of its Refresh(0) write, nil when the release went out.
-func releaseAllocation(key relayIdentity, unreleased error, now time.Time) {
+// error of its Refresh(0) write, nil when the release went out. r is the
+// allocation, so that a ghost the loss of its network already counted is not
+// counted again; nil for one known only by its key.
+func releaseAllocation(key relayIdentity, unreleased error, now time.Time, r *trackedRelay) {
 	allocationBook.Lock()
 	if allocationBook.live[key]--; allocationBook.live[key] <= 0 {
 		delete(allocationBook.live, key)
 	}
+	delete(allocationBook.tracked, r)
 	fresh := false
 	if unreleased == nil {
 		allocationBook.releasedAt[key] = now
 	} else {
-		fresh = orphanLocked(key, now)
+		fresh = countGhostLocked(key, r, now)
 	}
 	allocationBook.Unlock()
 
 	// One line per mark: a dying network fails all of a session's releases.
 	if fresh {
-		turnLog("[QUOTA] release of our allocation on %s did not go out (%v) — creds %s held there for %v, other relays go first",
+		turnLog("[QUOTA] release of our allocation on %s did not go out (%v) — creds %s held there for %v",
 			key.relay, unreleased, credsTag(key.user), orphanedAllocationLifetime)
 	}
 }
 
-// orphanLocked marks key until its newest orphan expires and reports whether
-// this starts a mark (none was in force). A mark that is only extended keeps
-// its steering line already logged.
-func orphanLocked(key relayIdentity, now time.Time) bool {
-	till, marked := allocationBook.orphanedTill[key]
-	fresh := !marked || !now.Before(till)
-	allocationBook.orphanedTill[key] = now.Add(orphanedAllocationLifetime)
-	if fresh {
-		delete(allocationBook.announced, key)
+// countGhostLocked counts allocation r as a ghost on key, or only extends the
+// mark if r was counted under it already (countedLocked), and reports whether a
+// mark starts (orphanLocked). The same allocation reported again later — its
+// gateway lost once more after it came back with its sessions alive, its
+// release failing after that — is held longer, not twice (Codex review of the
+// Android port, 18.10).
+func countGhostLocked(key relayIdentity, r *trackedRelay, now time.Time) bool {
+	if r != nil && countedLocked(key, r, now) {
+		orphanLocked(key, now, 0)
+		return false
+	}
+	fresh := orphanLocked(key, now, 1)
+	if r != nil {
+		r.ghostOf = allocationBook.markOf[key]
 	}
 	return fresh
 }
 
-// orphanLiveAllocations marks every allocation still counted live: the network
-// their sockets were opened on is gone, and they can no longer release
-// themselves. Called on the host's transitions only — the physical gateway
+// countedLocked reports whether allocation r is counted under the mark on key
+// in force at now.
+func countedLocked(key relayIdentity, r *trackedRelay, now time.Time) bool {
+	till, marked := allocationBook.orphanedTill[key]
+	return marked && now.Before(till) && r.ghostOf != 0 && r.ghostOf == allocationBook.markOf[key]
+}
+
+// orphanLocked counts n more ghosts on key, marks it until the newest of them
+// expires, and reports whether this starts a mark (none was in force: the count
+// starts again from these, under a new number). A mark that is only extended
+// keeps its steering line already logged.
+func orphanLocked(key relayIdentity, now time.Time, n int) bool {
+	till, marked := allocationBook.orphanedTill[key]
+	fresh := !marked || !now.Before(till)
+	if fresh {
+		allocationBook.lastMark++
+		allocationBook.markOf[key] = allocationBook.lastMark
+		allocationBook.orphans[key] = 0
+		delete(allocationBook.announced, key)
+	}
+	allocationBook.orphans[key] += n
+	// Never earlier than it was: a wall clock stepped back must not cut short
+	// the ghosts already counted.
+	if t := now.Add(orphanedAllocationLifetime); fresh || t.After(till) {
+		allocationBook.orphanedTill[key] = t
+	}
+	return fresh
+}
+
+// noteOutOfReach marks (user, relay) orphaned after a session whose allocation
+// the relay no longer answered to: 400 on CreatePermission after a thaw, or no
+// echo to the post-wake probe (sessionOutOfReach). The socket woke under a
+// new NAT mapping while the allocation lives on under the old 5-tuple (anton48's
+// stand, build 432): the Refresh(0) the close sent went out on the new one,
+// which the relay does not know, so the seat is held for the rest of the
+// allocation's lifetime — and the release "went out", so releasedAt would read a
+// 486 from there as our release settling. The ghost counts towards steering the
+// next attempts to the other relays, and settlingQuotaError leaves an orphaned
+// relay out. r is the session's allocation (trackedAllocation): one its failed
+// release already counted is not counted twice.
+func noteOutOfReach(user, relay string, r *trackedRelay, now time.Time) {
+	key := relayIdentity{user: user, relay: relay}
+	allocationBook.Lock()
+	fresh := countGhostLocked(key, r, now)
+	allocationBook.Unlock()
+	if fresh {
+		turnLog("[QUOTA] our allocation on %s was out of reach (the relay no longer knew its socket) — creds %s held there for %v",
+			relay, credsTag(user), orphanedAllocationLifetime)
+	}
+}
+
+// sessionOutOfReach reports whether a session ended because the relay no longer
+// knew its socket: the relay's own 400 on CreatePermission (hole, the kind of
+// blackhole the watchdog fired on — sessionBlackhole), or the post-wake probe's
+// verdict (err). The periodic detector's verdict is not one — a relay silent
+// for 90s on a network that is still there may just as well have dropped the
+// allocation, and a lost network marks the allocations itself
+// (orphanLiveAllocations).
+//
+// One reading for both things that ask: whether the session counts against
+// its relay and whether it leaves a seat at the relay (outOfReachSeated). It
+// used to be the text of the session's final error for one and nothing for the
+// other. hole is taken once, by runSession, for both: the allocation check runs
+// on a goroutine of its own and can still latch its 400 while the session is
+// being graded, and two readings of the watchdog would part on it.
+func sessionOutOfReach(hole blackholeKind, err error) bool {
+	if hole == blackholeOutOfReach {
+		return true
+	}
+	var dead *deadStreamError
+	return errors.As(err, &dead) && dead.probe
+}
+
+// outOfReachSeated reports whether a session that ended out of the relay's
+// reach leaves its allocation seated there (noteOutOfReach). The probe's
+// verdict does over either transport: the relay may hold the allocation of a
+// connection that went quiet for its whole lifetime. A 400 does only over UDP,
+// where it is the relay answering a 5-tuple it does not know while the
+// allocation lives on under the old one. Over TCP it came on the connection the
+// allocation was made on, which the relay does know: the allocation itself has
+// lapsed or been given back, and holds no seat (Codex review of the Android
+// port, 23.10).
+func outOfReachSeated(hole blackholeKind, overTCP bool, err error) bool {
+	if !sessionOutOfReach(hole, err) {
+		return false
+	}
+	return !overTCP || hole != blackholeOutOfReach
+}
+
+// orphanLiveAllocations marks every allocation still live: the network their
+// sockets were opened on is gone, and they can no longer release themselves —
+// each counted once under a mark (countGhostLocked). Called on the host's
+// transitions only — the physical gateway
 // lost (setNetworkAvailable) or exchanged for another (NotifyNetworkChange) —
 // never on the polls that repeat an unchanged state, so a mark is not extended
 // on every offline tick.
@@ -175,75 +322,101 @@ func orphanLiveAllocations(now time.Time) {
 		key   relayIdentity
 		count int
 	}
+	byKey := map[relayIdentity][]*trackedRelay{}
+	for r := range allocationBook.tracked {
+		byKey[r.key] = append(byKey[r.key], r)
+	}
 	var marked []orphaned
-	for key, count := range allocationBook.live {
-		orphanLocked(key, now)
-		marked = append(marked, orphaned{key, count})
+	for key, rs := range byKey {
+		uncounted := 0
+		for _, r := range rs {
+			if !countedLocked(key, r, now) {
+				uncounted++
+			}
+		}
+		orphanLocked(key, now, uncounted)
+		for _, r := range rs {
+			r.ghostOf = allocationBook.markOf[key]
+		}
+		marked = append(marked, orphaned{key, len(rs)})
 	}
 	allocationBook.Unlock()
 
 	// Durations, not clock times: a line stamped later cannot disagree with them.
 	for _, m := range marked {
-		turnLog("[QUOTA] the network is gone with %d allocation(s) on %s (creds %s) — orphaned for %v, other relays go first",
+		turnLog("[QUOTA] the network is gone with %d allocation(s) on %s (creds %s) — orphaned for %v",
 			m.count, m.key.relay, credsTag(m.key.user), orphanedAllocationLifetime)
 	}
 }
 
-// attemptOrder is the server order for one attempt on user's credential: the
-// session's order (assignServers — election, stand-downs, round-robin by
-// stream), with relays still holding our orphaned allocations for this
-// credential moved to the end. Callers comparing "where would the next attempt
-// go" must use this too, not assignServers alone, or they see a different head
-// than the attempt.
-func attemptOrder(user string, addrs []string, streamID int, now time.Time) []string {
-	return orderAroundOrphans(user, assignServers(addrs, streamID), now)
-}
+// orphanSteerAt is how many of a credential's ghosts on a relay make it crowded:
+// half of VK's quota of about ten (see above). Beside fewer there is room for
+// the one or two streams the spread sends there.
+const orphanSteerAt = 5
 
-// orderAroundOrphans moves the relays holding orphaned allocations for user to
-// the end, keeping the order within both parts. It returns a new slice.
-func orderAroundOrphans(user string, addrs []string, now time.Time) []string {
+// crowdedRelays returns the relays of addrs that hold orphanSteerAt or more of
+// user's ghosts, sweeping the marks that have expired; nil if none does.
+func crowdedRelays(user string, addrs []string, now time.Time) map[string]bool {
 	allocationBook.Lock()
-	var clean, orphaned []string
-	var orphanKeys []relayIdentity
+	defer allocationBook.Unlock()
+	var crowded map[string]bool
 	for _, addr := range addrs {
 		key := relayIdentity{user: user, relay: addr}
 		till, ok := allocationBook.orphanedTill[key]
 		if ok && !now.Before(till) {
 			delete(allocationBook.orphanedTill, key)
 			delete(allocationBook.announced, key)
-			ok = false
+			delete(allocationBook.orphans, key)
+			delete(allocationBook.markOf, key)
+			continue
 		}
-		if ok {
-			orphaned = append(orphaned, addr)
-			orphanKeys = append(orphanKeys, key)
-		} else {
+		if ok && allocationBook.orphans[key] >= orphanSteerAt {
+			if crowded == nil {
+				crowded = map[string]bool{}
+			}
+			crowded[addr] = true
+		}
+	}
+	return crowded
+}
+
+// announceCrowded logs each crowded relay an attempt's order steered around —
+// one in order behind a head that is not crowded — once per mark: ten streams
+// consult this at once.
+func announceCrowded(user string, crowded map[string]bool, order []string, now time.Time) {
+	if len(crowded) == 0 || len(order) == 0 || crowded[order[0]] {
+		return
+	}
+	var clean []string
+	for _, addr := range order {
+		if !crowded[addr] {
 			clean = append(clean, addr)
 		}
 	}
-	if len(orphaned) == 0 || len(clean) == 0 {
-		// Nothing to steer around, or nowhere else to go: the order stands.
-		allocationBook.Unlock()
-		return append([]string(nil), addrs...)
-	}
-	// One line per mark, not per worker: ten streams consult this at once.
 	type steer struct {
-		key  relayIdentity
-		left time.Duration
+		key   relayIdentity
+		count int
+		left  time.Duration
 	}
 	var steered []steer
-	for _, key := range orphanKeys {
-		if !allocationBook.announced[key] {
-			allocationBook.announced[key] = true
-			steered = append(steered, steer{key, allocationBook.orphanedTill[key].Sub(now).Round(time.Second)})
+	allocationBook.Lock()
+	for _, addr := range order {
+		key := relayIdentity{user: user, relay: addr}
+		// Looked at again: another worker may have swept the mark since, or a
+		// new one have started in its place.
+		till, marked := allocationBook.orphanedTill[key]
+		if !crowded[addr] || allocationBook.announced[key] || !marked || !now.Before(till) || allocationBook.orphans[key] < orphanSteerAt {
+			continue
 		}
+		allocationBook.announced[key] = true
+		steered = append(steered, steer{key, allocationBook.orphans[key], till.Sub(now).Round(time.Second)})
 	}
 	allocationBook.Unlock()
 
 	for _, s := range steered {
-		turnLog("[QUOTA] %s still holds our orphaned allocations for creds %s (%v left) — dialing %v first",
-			s.key.relay, credsTag(s.key.user), s.left, clean)
+		turnLog("[QUOTA] %s still holds %d of our orphaned allocations for creds %s (%v left) — dialing %v first",
+			s.key.relay, s.count, credsTag(s.key.user), s.left, clean)
 	}
-	return append(clean, orphaned...)
 }
 
 // settlingQuotaError reports whether err, the outcome of an attempt on user's

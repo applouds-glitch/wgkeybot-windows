@@ -43,57 +43,149 @@ func fetchCreds(ctx context.Context, link string, groupID int) (user, pass strin
 	return
 }
 
-// assignServers returns the TURN servers this stream should try, best first.
+// assignRelays returns the TURN servers a stream should try, its own first:
+// stream i prefers the (i mod n)-th of the n usable servers, so ten streams
+// split 5/5 over the two relays VK hands out, and the rest of the list are its
+// failover candidates.
 //
 // The list is sorted into a canonical order so the same physical server gets the
 // same index in every group, regardless of the order VK returned the urls in for
 // that group's link. Servers with a verdict against them — demoted for failing a
-// data-plane handshake, or standing down under a penalty — are dropped outright
-// rather than demoted to the back: runWithCreds fans out to addrs[1:] all at
-// once when the head fails to Allocate, so a dead host left anywhere in the list
-// can still win that race and cost the stream another session.
+// data-plane handshake, standing down under a penalty, or resting from a bad
+// downlink (relay_rest.go) — are dropped outright rather than demoted to the
+// back: runWithCreds fans out to addrs[1:] all at once when the head fails to
+// Allocate, so a dead host left anywhere in the list can still win that race and
+// cost the stream another session. A healthy session is never moved, except off
+// a relay that is being rested.
 //
-// What is left is assigned one of two ways:
-//
-//   - Once the session has elected a server (see turn_server_election.go), every
-//     stream in every group runs on it. The point of the election is that only
-//     one of the relays VK returns is reliably working, so spreading across them
-//     buys nothing and costs a stalled stream per dead host.
-//   - Until then, round-robin by stream ID. This is the probing phase and it has
-//     to stay a spread: a server nobody dials never proves itself, so pinning
-//     before the verdict is in would make the verdict unreachable.
-//
-// If every server has a verdict against it the original list stands. That is an
+// If every server has a verdict against it the whole list stands. That is an
 // outage, not a bad host, and an empty list would leave the stream nothing to
-// dial; the next attempts re-probe all of them.
+// dial; the next attempts re-probe all of them. Not in canonical order, though:
+// outageOrder puts a server that failed only Allocates ahead of one that
+// allocated and then failed the data plane, because the latter never fails over,
+// and spreads the streams' heads over the servers that carried.
+//
+// Every stream used to go to one elected relay once a server had proven
+// itself. Spread, the downlink of each relay carries its share of the traffic,
+// and when one relay's downlink goes bad the judge has another to compare it
+// with (relay_judge.go) — a single relay going bad under every stream looked
+// healthy to every check the session had (Android bench, 2026-10-10).
 //
 // Returns a fresh slice — addrs may alias the cached ServerAddrs slice (returned
 // by reference on a cache hit), so it must not be mutated in place.
-func assignServers(addrs []string, streamID int) []string {
-	if len(addrs) < 2 {
-		return addrs
-	}
+func assignRelays(addrs []string, streamID int, now time.Time) []string {
+	return assignRelaysAround(addrs, streamID, now, nil, nil)
+}
+
+// assignRelaysAround is assignRelays with the relays in crowded — full of a
+// credential's ghosts (orphaned_allocations.go) — put behind the rest, and
+// those in lossy — losing downlink in the window a stream was moved off a
+// rested relay (relay_move.go) — behind the clean ones, ahead of the crowded.
+// The streams are spread within each tier, rotated among its relays: rotated
+// first and moved after, every crowded relay would hand its streams to the
+// relay behind it, the heads of six streams over A…F with B C D crowded coming
+// out A E E E E F instead of A E F A E F. Android periodic-download run 18.10,
+// the dark at 21:30: with one relay crowded and two more marked, 5 of the 10
+// streams came back on one of the three left.
+func assignRelaysAround(addrs []string, streamID int, now time.Time, crowded, lossy map[string]bool) []string {
 	sorted := append([]string(nil), addrs...)
 	sort.Strings(sorted)
-
-	now := time.Now()
+	sorted = slices.Compact(sorted)
+	if len(sorted) < 2 {
+		return sorted
+	}
 	live := make([]string, 0, len(sorted))
 	for _, addr := range sorted {
-		if serverDemoted(addr) || serverPenalized(addr, now) {
-			continue
+		if relayUsable(addr, now) {
+			live = append(live, addr)
 		}
-		live = append(live, addr)
 	}
 	if len(live) == 0 {
-		live = sorted
+		return outageOrder(sorted, streamID, crowded)
 	}
-
-	if elected := electServer(live, now); elected != "" {
-		if idx := slices.Index(live, elected); idx >= 0 {
-			return rotateServers(live, idx)
+	var clean, losing, full []string
+	for _, addr := range live {
+		switch {
+		case crowded[addr]:
+			full = append(full, addr)
+		case lossy[addr]:
+			losing = append(losing, addr)
+		default:
+			clean = append(clean, addr)
 		}
 	}
-	return rotateServers(live, streamID%len(live))
+	out := make([]string, 0, len(live))
+	for _, tier := range [][]string{clean, losing, full} {
+		if len(tier) > 0 {
+			out = append(out, rotateServers(tier, streamSlot(streamID, len(tier)))...)
+		}
+	}
+	return out
+}
+
+// streamSlot is streamID's place among n relays, never negative.
+func streamSlot(streamID, n int) int {
+	idx := streamID % n
+	if idx < 0 {
+		idx += n
+	}
+	return idx
+}
+
+// relayUsable reports whether addr has no verdict against it: not demoted, not
+// penalized, not resting.
+func relayUsable(addr string, now time.Time) bool {
+	return !serverDemoted(addr) && !serverPenalized(addr, now) && !relayResting(addr, now)
+}
+
+// hasOtherUsableRelay reports whether a session on addr, dialed from relays,
+// has another usable relay to go to (relay_rest.go).
+func hasOtherUsableRelay(relays []string, addr string, now time.Time) bool {
+	for _, r := range relays {
+		if r != addr && relayUsable(r, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// streamAttemptOrder is the server order for one attempt of stream streamID on
+// user's credential: the stream's own order (assignRelays — stand-downs,
+// demotions, the spread), with relays still holding our orphaned allocations
+// for this credential moved to the end. Callers comparing "where would the next
+// attempt go" must use this too, not assignRelays alone, or they see a
+// different head than the attempt.
+func streamAttemptOrder(user string, addrs []string, streamID int, now time.Time) []string {
+	return streamAttemptOrderAround(user, addrs, streamID, now, nil)
+}
+
+// streamAttemptOrderAround is streamAttemptOrder for the attempt of a stream
+// just moved off a rested relay (relay_move.go): the relays losing at the move
+// dialed after the others that are not crowded, and the head the move picked
+// first while it is in the first tier.
+func streamAttemptOrderAround(user string, addrs []string, streamID int, now time.Time, move *relayMove) []string {
+	var lossy map[string]bool
+	if move != nil {
+		lossy = move.lossy
+	}
+	crowded := crowdedRelays(user, addrs, now)
+	order := assignRelaysAround(addrs, streamID, now, crowded, lossy)
+	if move != nil {
+		order = headFirst(order, move.head, crowded, lossy, now)
+	}
+	announceCrowded(user, crowded, order, now)
+	return order
+}
+
+// relayLast is order with relay moved to its end, if it is there and not alone.
+func relayLast(order []string, relay string) []string {
+	i := slices.Index(order, relay)
+	if i < 0 || len(order) < 2 {
+		return order
+	}
+	out := make([]string, 0, len(order))
+	out = append(append(out, order[:i]...), order[i+1:]...)
+	return append(out, relay)
 }
 
 // rotateServers returns list rotated so idx comes first, leaving the rest in

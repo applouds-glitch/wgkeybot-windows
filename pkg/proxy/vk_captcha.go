@@ -8,7 +8,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -167,6 +166,7 @@ func (ep captchaEndpoints) methodURL(method string) string {
 }
 
 var captchaFormFieldOrder = map[string][]string{
+	"captchaNotRobot.initSession": {"session_token", "domain", "lang", "access_token"},
 	"captchaNotRobot.settings": {
 		"session_token", "domain", "adFp", "access_token",
 	},
@@ -343,10 +343,18 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		}
 		lastErr = err
 		turnLog("[STREAM %d] [Captcha] attempt %d/%d failed: %v", streamID, attempt, maxAttempts, err)
+		// Both verdicts judge the identity we presented rather than this
+		// particular request, so the persona is retired before anything else
+		// runs — every later rung of this captcha would otherwise keep showing VK
+		// the device it has just refused (Android 15e811c7).
+		if errors.Is(err, errCaptchaBot) {
+			captchaAttemptOf(ctx).burn("VK returned BOT for this device")
+		}
 		// VK has throttled this captcha session: another attempt would only
 		// burn more requests against the rate limit. Stop and let the caller
 		// fall back to the WebView.
 		if isCaptchaSessionExhausted(err) {
+			captchaAttemptOf(ctx).burn("VK rate-limited the captcha session")
 			turnLog("[STREAM %d] [Captcha] Session throttled (ERROR_LIMIT) — abandoning auto solve", streamID)
 			return "", err
 		}
@@ -387,10 +395,15 @@ func solveVkCaptchaOnce(ctx context.Context, captchaErr *VkCaptchaError, streamI
 	}
 	turnLog("[STREAM %d] [Captcha] PoW solved", streamID)
 
-	debugInfo, err := fetchDebugInfoFromScript(ctx, bootstrap.ScriptURL, client, profile, ep)
-	if err != nil {
-		turnLog("[STREAM %d] [Captcha] Warning: could not fetch debug_info dynamically: %v — using fallback", streamID, err)
-		debugInfo = captchaDebugInfo
+	// The BFF page carries debug_info in window.vk; the older one had it in the
+	// not_robot_captcha script only.
+	debugInfo := bootstrap.DebugInfo
+	if debugInfo == "" {
+		debugInfo, err = fetchDebugInfoFromScript(ctx, bootstrap.ScriptURL, client, profile, ep)
+		if err != nil {
+			turnLog("[STREAM %d] [Captcha] Warning: could not fetch debug_info dynamically: %v — using fallback", streamID, err)
+			debugInfo = captchaDebugInfo
+		}
 	}
 
 	bootstrapHasSlider := false
@@ -406,9 +419,10 @@ func solveVkCaptchaOnce(ctx context.Context, captchaErr *VkCaptchaError, streamI
 	// then spun up a *second* session for the slider, duplicating
 	// settings/componentDone/check on the same token — which tripped VK's
 	// per-token rate limit (ERROR_LIMIT) before the slider image could load.
-	if useSliderPOC || bootstrapHasSlider {
+	// A BFF session opens with initSession, which only this solver sends.
+	if useSliderPOC || bootstrapHasSlider || bootstrap.IsBFF {
 		successToken, err := callCaptchaNotRobotWithSliderPOC(
-			ctx, captchaErr.SessionToken, hash, debugInfo, streamID, client, profile, bootstrap.Settings, ep,
+			ctx, captchaErr.SessionToken, hash, debugInfo, streamID, client, profile, bootstrap.Settings, ep, bootstrap,
 		)
 		if err != nil {
 			return "", fmt.Errorf("captchaNotRobot slider POC failed: %w", err)
@@ -461,6 +475,24 @@ func captchaDeviceLanguages(profile Profile) (string, string) {
 type captchaViewport struct {
 	Width  int
 	Height int
+	// AvailHeight is the screen above the taskbar, InnerHeight the page inside
+	// the browser's chrome. Drawn once with the screen: the device JSON reports
+	// them, and every cursor point of the session has to fall inside the page
+	// they describe (clampToPage) — a point below innerHeight is a pointer no
+	// browser could have reported.
+	AvailHeight int
+	InnerHeight int
+}
+
+// cursorPageMargin keeps cursor points this far inside the page: the pointer
+// over a page never sits on its very last row or column.
+const cursorPageMargin = 8
+
+// clampToPage moves a cursor point inside the page vp describes: innerWidth is
+// the screen width, as the device JSON says.
+func clampToPage(x, y int, vp captchaViewport) (int, int) {
+	return min(max(x, cursorPageMargin), vp.Width-1-cursorPageMargin),
+		min(max(y, cursorPageMargin), vp.InnerHeight-1-cursorPageMargin)
 }
 
 // randomViewport returns a randomized viewport matching real desktop Chrome variability.
@@ -468,31 +500,14 @@ func randomViewport() captchaViewport {
 	widths := []int{1920, 1920, 1920, 1366, 1440, 1536, 1680, 2560} // 1920 weighted 3×
 	heights := []int{1080, 1080, 1080, 768, 900, 864, 1050, 1440}
 	idx := rand.Intn(len(widths))
-	return captchaViewport{Width: widths[idx], Height: heights[idx]}
+	height := heights[idx]
+	return captchaViewport{
+		Width:       widths[idx],
+		Height:      height,
+		AvailHeight: height - 40 - rand.Intn(21),  // taskbar: 40-60px
+		InnerHeight: height - 111 - rand.Intn(31), // browser chrome: 111-141px
+	}
 }
-
-// generateBrowserFp returns the browser fingerprint every captcha of this
-// process presents. Drawn once, not per call: VK's bot detector burns a session
-// that shows a fresh browser_fp on every attempt, so one stable value reads as
-// a returning device instead of a bot cycling identities. (Android persists it
-// across installs; the tray process outliving every reconnect is the closest
-// this client gets without a new store.)
-func generateBrowserFp(_ Profile, _ captchaViewport) string {
-	sessionBrowserFpOnce.Do(func() {
-		b := make([]byte, 16)
-		if _, err := cryptorand.Read(b); err != nil {
-			sessionBrowserFp = fmt.Sprintf("%016x%016x", rand.Int63(), rand.Int63())
-			return
-		}
-		sessionBrowserFp = hex.EncodeToString(b)
-	})
-	return sessionBrowserFp
-}
-
-var (
-	sessionBrowserFpOnce sync.Once
-	sessionBrowserFp     string
-)
 
 // captchaAdFpFromBrowserFp derives the adFp (window.rb_sync.id) from the
 // browser_fp: the same 16 random bytes in base64url. The reference browser sent
@@ -507,9 +522,10 @@ func captchaAdFpFromBrowserFp(browserFp string) string {
 }
 
 // generateHumanCursor produces a realistic mouse trajectory with returns, pauses, and micro-jitter.
-func generateHumanCursor() string {
-	startX := 400 + rand.Intn(800) // wider range: 400-1200
-	startY := 200 + rand.Intn(500) // 200-700
+func generateHumanCursor(vp captchaViewport) string {
+	// The walk stays on the page: from a start of up to 1200x700 it drifts up to
+	// ~500px further, past a 1366x768 screen's page on both axes.
+	startX, startY := clampToPage(400+rand.Intn(800), 200+rand.Intn(500), vp) // 400-1200 x 200-700
 	startTime := time.Now().UnixMilli() - int64(rand.Intn(3000)+1500)
 	numPoints := 20 + rand.Intn(15)
 	points := make([]string, 0, numPoints)
@@ -533,6 +549,7 @@ func generateHumanCursor() string {
 			startX += rand.Intn(20) - 5 // -5..+14
 			startY += rand.Intn(18) - 3 // -3..+14 — not always downward
 		}
+		startX, startY = clampToPage(startX, startY, vp)
 		startTime += int64(rand.Intn(50) + 15) // 15-65ms between points
 		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, startX, startY, startTime))
 	}
@@ -611,8 +628,6 @@ func fetchCaptchaBootstrap(ctx context.Context, redirectURI string, client tlscl
 }
 
 func buildCaptchaDeviceJSON(profile Profile, vp captchaViewport) string {
-	availHeight := vp.Height - 40 - rand.Intn(21)  // taskbar: 40-60px
-	innerHeight := vp.Height - 111 - rand.Intn(31) // browser chrome: 111-141px
 	devicePixelRatio := 1
 	if vp.Width >= 2560 {
 		devicePixelRatio = 2
@@ -630,7 +645,7 @@ func buildCaptchaDeviceJSON(profile Profile, vp captchaViewport) string {
 
 	return fmt.Sprintf(
 		`{"screenWidth":%d,"screenHeight":%d,"screenAvailWidth":%d,"screenAvailHeight":%d,"innerWidth":%d,"innerHeight":%d,"devicePixelRatio":%d,"language":"%s","languages":%s,"webdriver":false,"hardwareConcurrency":%d,"deviceMemory":%d,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"%s"}`,
-		vp.Width, vp.Height, vp.Width, availHeight, vp.Width, innerHeight,
+		vp.Width, vp.Height, vp.Width, vp.AvailHeight, vp.Width, vp.InnerHeight,
 		devicePixelRatio,
 		language, languages,
 		hardwareConcurrency,
@@ -903,11 +918,13 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo stri
 		return resp, nil
 	}
 
-	// One viewport, one browser_fp and one adFp for the whole session — a
-	// device JSON built from a different draw than the browser_fp beside it is
-	// the kind of self-contradiction the detector is looking for.
-	vp := randomViewport()
-	browserFp := generateBrowserFp(profile, vp)
+	// One viewport, one browser_fp and one adFp for the whole session, all the
+	// persona's (captcha_persona.go) — a device JSON built from a different draw
+	// than the browser_fp beside it is the kind of self-contradiction the
+	// detector is looking for.
+	persona := captchaPersonaFor(ctx)
+	vp := captchaViewportFor(persona)
+	browserFp := persona.browserFp
 	adFp := captchaAdFpFromBrowserFp(browserFp)
 	baseValues := func() neturl.Values {
 		values := neturl.Values{}
@@ -961,7 +978,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, debugInfo stri
 	checkData.Set("accelerometer", "[]")
 	checkData.Set("gyroscope", "[]")
 	checkData.Set("motion", "[]")
-	checkData.Set("cursor", generateHumanCursor())
+	checkData.Set("cursor", generateHumanCursor(vp))
 	checkData.Set("taps", "[]")
 	checkData.Set("connectionRtt", connRtt)
 	checkData.Set("connectionDownlink", connDownlink)

@@ -74,3 +74,76 @@ func TestRestartTransportRefusesAfterStop(t *testing.T) {
 		t.Fatal("a rebuild after Stop started a proxy for a closed device")
 	}
 }
+
+// Wake — это сигнал хоста для всех циклов keepalive: эпоха сдвигается, а канал,
+// на котором цикл ждёт, закрывается.
+func TestWakeReachesTheKeepaliveLoops(t *testing.T) {
+	tun, err := NewTunnel(Config{VKLink: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, ch := hostWakeEpoch(), hostWakeChannel()
+	tun.Wake("gateway back")
+	if hostWakeEpoch() == epoch {
+		t.Fatal("the wake epoch did not move")
+	}
+	select {
+	case <-ch:
+	default:
+		t.Fatal("a loop parked on the wake channel was not woken")
+	}
+}
+
+// A captcha notification left in the channel by a captcha nobody waited for
+// here — asked for mid-session, solved by the tray's poll — is no captcha of
+// this start: the wait goes on to the start's own outcome instead of handing
+// Connect a captcha with no URL.
+func TestWaitReadyIgnoresAStaleCaptchaNotification(t *testing.T) {
+	if PendingCaptchaURL() != "" {
+		t.Skip("a captcha is pending from another test")
+	}
+	for i := 0; i < 20; i++ {
+		tun, b := tunnelWithBoot()
+		select {
+		case captchaNotifyCh <- struct{}{}:
+		default:
+		}
+		close(b.ready) // result 0: the start came up
+		if got := tun.WaitReady(time.Second); got != ReadyStatusOK {
+			t.Fatalf("round %d: a stale notification read as %v, want ReadyStatusOK", i, got)
+		}
+	}
+	// A start still running: the stale notification does not end the wait.
+	tun, b := tunnelWithBoot()
+	select {
+	case captchaNotifyCh <- struct{}{}:
+	default:
+	}
+	done := make(chan ReadyStatus, 1)
+	go func() { done <- tun.WaitReady(5 * time.Second) }()
+	select {
+	case got := <-done:
+		t.Fatalf("a stale notification ended the wait: %v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(b.ready)
+	if got := <-done; got != ReadyStatusOK {
+		t.Fatalf("the start's own outcome: %v, want ReadyStatusOK", got)
+	}
+}
+
+// The tray's choice of transport restarts the transport only when it changes,
+// and never on a tunnel that has stopped.
+func TestSetRelayOverTCPRestartsOnlyOnAChange(t *testing.T) {
+	stopped := &Tunnel{cfg: Config{UseUDP: true}, stopped: true}
+	if _, err := stopped.SetRelayOverTCP(true); err == nil {
+		t.Fatal("a stopped tunnel took a new transport")
+	}
+	same := &Tunnel{cfg: Config{UseUDP: true}}
+	if changed, err := same.SetRelayOverTCP(false); changed || err != nil {
+		t.Fatalf("UDP over UDP: changed=%v err=%v, want no restart", changed, err)
+	}
+	if !same.cfg.UseUDP {
+		t.Fatal("the transport changed although the choice had not")
+	}
+}

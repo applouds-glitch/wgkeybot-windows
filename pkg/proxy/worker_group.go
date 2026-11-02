@@ -26,7 +26,8 @@ const (
 
 // vkSemaphore limits concurrent VK API credential fetches across all groups.
 // A limit of 2 lets pairs of groups fetch in parallel while avoiding
-// hammering VK with unbounded concurrent authentication requests.
+// hammering VK with unbounded concurrent authentication requests. Taken by
+// getCredsCached on a miss only, never around a lookup (see there).
 var vkSemaphore = make(chan struct{}, 2)
 
 // allocSemaphore bounds concurrent TURN Allocate() handshakes. Without it,
@@ -46,6 +47,12 @@ type WorkerGroupConfig struct {
 	PeerType string
 	TurnIP   string
 	TurnPort int
+	// ExtraRelays join the relays VK hands out for the link (relay_extra.go).
+	ExtraRelays []string
+	// start is the evidence of the proxy start the workers belong to
+	// (start_outcome.go): what their dials say is booked there and on no other
+	// start's. nil outside a proxy start.
+	start *startEvidence
 }
 
 // WorkerGroup runs the streams for one VK link using an error-driven, per-worker
@@ -92,7 +99,7 @@ func WorkerGroup(ctx context.Context, cfg WorkerGroupConfig, streams []*stream) 
 // escalates to a user-visible terminal failure once no worker is left.
 //
 // The TURN server is assigned statically, round-robin by stream ID (see
-// assignServers), so the streams are spread evenly across every server VK
+// assignRelays), so the streams are spread evenly across every server VK
 // returned. The other servers are failover only: runWithCreds dials them just
 // for this attempt, and only after the assigned one errors. failStreak only
 // counts consecutive connect failures to drive the retry backoff. A session
@@ -107,7 +114,8 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		}
 	}
 
-	failStreak := 0
+	defer leaveTheDark(s) // dark_scout.go
+	var st workerBackoff
 	credFailStreak := 0 // consecutive credential fetches that failed for any reason
 	// The credential that has had its one more try after a 486 beside a relay
 	// that never answered (see quotaBesideSilence).
@@ -123,15 +131,9 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 
 		// Fetch credentials via the shared cache. A cache hit is cheap (no VK
 		// call); on a miss the per-slot lock single-flights the fetch so the
-		// group's workers don't stampede VK.
-		select {
-		case vkSemaphore <- struct{}{}:
-		case <-ctx.Done():
-			releaseNetworkPermit(permit)
-			return
-		}
+		// group's workers don't stampede VK, and the fetch takes vkSemaphore
+		// itself (getCredsCached).
 		user, pass, addrs, err := fetchCreds(ctx, cfg.Link, cfg.GroupID)
-		<-vkSemaphore
 		if err != nil {
 			releaseNetworkPermit(permit)
 			if ctx.Err() != nil {
@@ -190,37 +192,93 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		}
 		credFailStreak = 0
 
-		// Effective availability can disappear while credentials are being fetched.
-		// Re-check before Allocate unless this worker owns the single controlled
-		// probe permit. Healthy sessions never pass through this gate.
-		if !permit.unvalidatedProbe && !isNetworkAvailable() {
+		// Effective availability can disappear while credentials are being fetched,
+		// and a probe permit can be voided meanwhile (networkPermitCurrent): look
+		// again before Allocate. Healthy sessions never pass through this gate.
+		if !networkPermitCurrent(permit) {
 			releaseNetworkPermit(permit)
 			continue
 		}
 
-		// Apply optional manual TurnIP/TurnPort override to the fetched list.
-		addrs = applyTurnOverride(addrs, cfg)
+		// Apply optional manual TurnIP/TurnPort override to the fetched list,
+		// and the relays the config adds to it.
+		addrs = withExtraRelays(applyTurnOverride(addrs, cfg), cfg)
 
-		// Where this stream runs: the session's elected server once one is
-		// chosen, otherwise round-robin by stream ID, with the relays still
+		// The path the attempt begins on: a reset after this point — another
+		// network, a proxy start, a wake from sleep — makes whatever it finds
+		// about a path that is gone (dark_scout.go).
+		pathAtStart := darkEpoch()
+		// A scout turn is checked again here, after the credential fetch that
+		// may have outlasted its lease: one that has passed to another worker
+		// since does not dial alongside it, and waits again.
+		scouted := st.scouting
+		st.scouting = false
+		if scouted && !darkScoutDials(s, time.Now()) {
+			releaseNetworkPermit(permit)
+			if s.parkInTheDark(ctx, &st) {
+				return
+			}
+			continue
+		}
+
+		// Where this stream runs: its own relay, round-robin by stream ID over
+		// the relays with no verdict against them, with the relays still
 		// holding our orphaned allocations for this credential moved last
 		// (orphaned_allocations.go). The rest of the list follows only as
 		// failover for this attempt. Keep the full list for the later retry
 		// decision, including relays that recover meanwhile.
-		ordered := attemptOrder(user, addrs, s.id, time.Now())
+		// Just moved off a rested relay: the head the move picked first, the
+		// relays losing in that window last (relay_move.go).
+		now := time.Now()
+		ordered := s.attemptOrder(user, addrs, now, s.takeMove(now))
 		attemptHead := ordered[0]
 
+		// The attempt runs under a context of its own, so that the judge of
+		// relay loss can move it off a relay it rests (relay_rest.go).
+		attempt := beginRelayAttempt(ctx)
+		s.attempt.Store(attempt)
+		s.relays.Store(&addrs)
+		s.user.Store(&user)
 		start := time.Now()
-		runErr := s.runWithCreds(ctx, user, pass, ordered, cfg)
+		// The proof that wakes this worker if the attempt fails into a dark
+		// path: the next one from now (path_revival.go).
+		proven := nextPathProof()
+		ownProofs := s.pathProofs.Load()
+		heardAtStart := relayHeardMark() // dark_scout.go
+		runErr := s.runWithCreds(attempt.ctx, user, pass, ordered, cfg)
 		sessionDur := time.Since(start)
+		if s.pathProofs.Load() != ownProofs {
+			// The session got through: only a proof made after it came down
+			// says the path is back since.
+			proven = nextPathProof()
+		}
+		s.attempt.Store(nil)
+		s.relays.Store(nil)
+		s.user.Store(nil)
+		moved := attempt.end()
 		releaseNetworkPermit(permit)
+		if scouted {
+			darkScoutDone(s, start, time.Now(),
+				ctx.Err() == nil && !moved && s.pathProofs.Load() == ownProofs &&
+					parksInTheDark(runErr) && !localNetworkError(runErr))
+		}
 
 		if ctx.Err() != nil {
 			return
 		}
-		if !isNetworkAvailable() {
+		if moved {
+			// Moved off a relay that is being rested: not a failure of
+			// anything, so reconnect at once — onto another relay.
+			st.reset()
+			continue
+		}
+		if !isNetworkAvailable() && !(permit.unvalidatedProbe && classifyCredError(runErr)) {
 			// Skip per-worker retry delays while offline. The gate above resumes on
 			// the host's signal, fresh TURN proof, or one rate-limited probe permit.
+			// Not the probe's credential refusal: a relay answered it, and unless
+			// the slot is given up below, every probe after it — one a minute —
+			// meets the same credential (Codex review 24.10: an on-link network
+			// after the gateway left, its proof cleared with the gateway).
 			continue
 		}
 
@@ -230,7 +288,7 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 			// assigned server) after a brief delay, with the backoff reset (avoids
 			// a hot loop if the server keeps closing immediately).
 			turnLog("[WORKER %d] Stream closed by server → reconnecting", s.id)
-			failStreak = 0
+			st.reset()
 			select {
 			case <-time.After(time.Duration(500+rand.Intn(500)) * time.Millisecond):
 			case <-ctx.Done():
@@ -272,7 +330,9 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 			turnLog("[WORKER %d] 486 from %s while %s gave no answer — one more try on the same creds before they are given up",
 				s.id, quota, silent)
 		}
-		if !graced && classifyCredError(runErr) {
+		// Unless it is a 486 the breaker holds minting against: a relay refusing
+		// fresh credentials is not cured by another one (quota_breaker.go).
+		if !graced && classifyCredError(runErr) && !quotaRefusalPausesMinting(runErr, cfg.GroupID, user, time.Now()) {
 			refreshGroupCreds(cfg.GroupID, user)
 		}
 
@@ -280,23 +340,38 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 		// fresh failure (reset the backoff) rather than as part of a failure
 		// streak.
 		if sessionDur >= healthySessionDuration {
-			failStreak = 0
+			st.reset()
 		} else {
-			failStreak++
+			st.failed(attemptHead)
 		}
 
 		// A failure on a server the next attempt will not even dial is not a
-		// repeat of the same failure: the election (or a stand-down) has just
+		// repeat of the same failure: a demotion or a stand-down has just
 		// moved this stream to a different host, and that host deserves a first
 		// attempt, not the backoff the dead one earned. Without this a stream
 		// that failed twice on a dead relay waited 7-17s before trying the
 		// working one — most of the connect budget, spent sleeping next to a
 		// server that was already known to work.
-		if attemptOrder(user, addrs, s.id, time.Now())[0] != attemptHead {
-			failStreak = 0
-		}
+		//
+		// And only to a relay this streak has not started on (failedHeads): it
+		// has had its first attempt, and the streak is its as much as the
+		// other's. Two relays failing their handshakes: the first failure
+		// demotes the head and the next attempt starts on the other, fresh; its
+		// failure demotes that one too, and with every relay demoted
+		// outageOrder hands the first one back — a "new" head that has already
+		// failed in this streak, and the streak started over a second time.
+		// Whatever else flips the head between relays the streak has tried (an
+		// orphan mark, a penalty running out) did the same on every flip. The
+		// set lives as long as the streak: reset forgets it, this reset keeps
+		// it.
+		//
+		// The next attempt's head by the rule the next attempt dials by, the
+		// relay this stream avoids included (relay_heard_by_others.go). A
+		// move's head is not reapplied: it is for the one attempt after the
+		// move, and that was this one.
+		st.headMoved(attemptHead, s.attemptOrder(user, addrs, time.Now(), nil)[0])
 
-		retryDelay := reconnectDelay(failStreak)
+		retryDelay := reconnectDelay(st.failStreak)
 		note := ""
 		// 486 (TURN allocation quota) after a mass teardown — say a host freeze
 		// past the relay idle timeout, or a second network drop within ten
@@ -323,16 +398,48 @@ func runWorker(ctx context.Context, cfg WorkerGroupConfig, s *stream, stagger ti
 			note = " (one more try on these creds)"
 		} else if isQuotaError(runErr) {
 			if credsReplaced(cfg.GroupID, user) {
-				failStreak = 0
-				retryDelay = reconnectDelay(failStreak)
+				st.reset()
+				retryDelay = reconnectDelay(st.failStreak)
 				note = " (on replaced creds)"
 			} else {
 				retryDelay = quotaCooldown()
 			}
 		}
-		turnLog("[WORKER %d] Error (streak %d): %v → retry in %v%s", s.id, failStreak, runErr, retryDelay, note)
+		// Into a path that is dark still, no redial at all until it is back (but
+		// the scout's, dark_scout.go); and out of one, a delay the dark earned
+		// does not outlast it (below).
+		if parksInTheDark(runErr) {
+			if dark, why := findsTheDark(relayOverTCP(cfg), heardAtStart, pathAtStart, start, runErr, time.Now()); dark {
+				turnLog("[WORKER %d] Error (streak %d): %v → parked: the path to the relays is dark (%s)",
+					s.id, st.failStreak, runErr, why)
+				if s.parkInTheDark(ctx, &st) {
+					return
+				}
+				continue
+			}
+		}
+		turnLog("[WORKER %d] Error (streak %d): %v → retry in %v%s", s.id, st.failStreak, runErr, retryDelay, note)
+		// A delay the dark earned ends when another stream's session gets
+		// through (path_revival.go).
+		revivable := pathWideFailure(runErr)
+		var revived <-chan struct{}
+		if revivable {
+			revived = proven
+		}
+		workerWaits(workerWait{stream: s.id, delay: retryDelay, revivable: revivable})
+		deadline := time.Now().Add(retryDelay)
 		select {
 		case <-time.After(retryDelay):
+		case <-revived:
+			// One at a time behind the other workers the same proof woke.
+			if !awaitRevivalSlot(ctx, deadline) {
+				return
+			}
+			st.reset()
+			if early := time.Until(deadline); early > 0 {
+				turnLog("[WORKER %d] another stream's session got through — the path to the relays is back: reconnecting now, %v early",
+					s.id, early.Round(100*time.Millisecond))
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -376,6 +483,77 @@ func isTerminalCredError(err error) bool {
 	return isCallUnavailable(err) || errors.Is(err, errCallRequiresAuth)
 }
 
+// workerWait is a wait a worker goes into before its next attempt.
+type workerWait struct {
+	stream int
+	delay  time.Duration
+	// revivable: another stream's session getting through ends it; parked: it
+	// lasts while the path is dark rather than for delay (path_revival.go).
+	revivable, parked bool
+}
+
+// workerWaits is called as a worker goes into the wait before its next attempt.
+// A seam for the tests, which have to know the worker is in that wait and not
+// still on its way there.
+var workerWaits = func(workerWait) {}
+
+// attemptOrder is the order an attempt of this stream on user's credential
+// dials addrs in: streamAttemptOrderAround — move is the head of a move off a
+// rested relay, nil for none — with the relay this stream's handshakes keep
+// failing on while others hear it put last, for this stream only
+// (relay_heard_by_others.go). The attempt's own order and the check of whether
+// the next one starts elsewhere (runWorker) are both this.
+func (s *stream) attemptOrder(user string, addrs []string, now time.Time, move *relayMove) []string {
+	ordered := streamAttemptOrderAround(user, addrs, s.id, now, move)
+	if avoid := s.avoidedRelay(); avoid != "" {
+		ordered = relayLast(ordered, avoid)
+	}
+	return ordered
+}
+
+// workerBackoff is what one attempt of a worker leaves for the next: the
+// failure streak that drives reconnectDelay, and the heads the attempts of this
+// streak started on (failedHeads). A head change resets the streak only to a
+// relay not among them (runWorker); reset forgets them with the streak.
+type workerBackoff struct {
+	failStreak  int
+	failedHeads map[string]struct{}
+	// scouting: the next attempt is this worker's turn to dial a dark path
+	// (dark_scout.go).
+	scouting bool
+}
+
+// reset ends the streak: the next failure starts a new one, on any relay.
+func (st *workerBackoff) reset() {
+	st.failStreak = 0
+	clear(st.failedHeads)
+}
+
+// failed counts an attempt that started on head and failed.
+func (st *workerBackoff) failed(head string) {
+	st.failStreak++
+	if st.failedHeads == nil {
+		st.failedHeads = map[string]struct{}{}
+	}
+	st.failedHeads[head] = struct{}{}
+}
+
+// failedOn reports whether an attempt of this streak started on head.
+func (st *workerBackoff) failedOn(head string) bool {
+	_, ok := st.failedHeads[head]
+	return ok
+}
+
+// headMoved resets the streak when the next attempt starts on another relay
+// than this one's head, unless an attempt of this streak has failed there
+// already. failedHeads is kept: the streak is over, the relays it tried are
+// still tried.
+func (st *workerBackoff) headMoved(head, next string) {
+	if next != head && !st.failedOn(next) {
+		st.failStreak = 0
+	}
+}
+
 // reconnectDelay returns the backoff before a worker's next connect attempt.
 // Transient TURN allocate failures (a lost UDP packet, a brief server-side
 // race) usually clear on a fresh attempt — and the next attempt re-races all
@@ -394,6 +572,15 @@ func reconnectDelay(failStreak int) time.Duration {
 		base = 30 * time.Second
 	}
 	return base + time.Duration(5+rand.Intn(11))*time.Second
+}
+
+// isAllocateMismatch: the relay answered 437 — a 5-tuple that already has an
+// allocation (Allocate: the translator handed this socket the port of one out
+// of reach), or none any more (Refresh, a deallocate). Never the credential's
+// fault, and not the relay's: the worker's next attempt takes a fresh socket.
+func isAllocateMismatch(err error) bool {
+	code, ok := turnErrorCode(err)
+	return ok && code == stun.CodeAllocMismatch
 }
 
 // isQuotaError reports whether err is specifically a TURN allocation-quota
@@ -466,9 +653,14 @@ func quotaCooldown() time.Duration {
 func classifyCredError(err error) bool {
 	if code, ok := turnErrorCode(err); ok {
 		switch code {
+		// 437 is not here. iOS field log 2026-09-28 12:58: Allocate answered
+		// 437 on a fresh socket, the credential was rotated, and the fresh
+		// credential got the same 437 on both relays — the 5-tuple was the
+		// problem (a port the translator reused for an allocation out of
+		// reach), and the worker's next socket succeeded. A trip to VK for it
+		// is a step towards a captcha for nothing (isAllocateMismatch).
 		case stun.CodeUnauthorized, // 401
 			stun.CodeStaleNonce,           // 438
-			stun.CodeAllocMismatch,        // 437
 			stun.CodeWrongCredentials,     // 441
 			stun.CodeAllocQuotaReached,    // 486
 			stun.CodeInsufficientCapacity: // 508
@@ -486,7 +678,6 @@ func classifyCredError(err error) bool {
 		strings.Contains(e, "error 401") ||
 		strings.Contains(e, "unauthorized") ||
 		strings.Contains(e, "stale nonce") ||
-		strings.Contains(e, "allocation mismatch") ||
 		strings.Contains(e, "attribute not found") ||
 		strings.Contains(e, "error 508") ||
 		strings.Contains(e, "error 29")

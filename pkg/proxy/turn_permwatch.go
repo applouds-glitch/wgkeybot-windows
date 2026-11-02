@@ -50,6 +50,21 @@ const (
 	// not change the outcome, but it lets the teardown carry a real reason
 	// instead of surfacing as a bare "use of closed network connection".
 	allocClosedMarker = "closing TURN allocation"
+
+	// The relay's answer inside a permFailMarker line, as stun.TurnError words
+	// it: "<type> (error <code>: <reason>)". A CreatePermission answered 400 is
+	// the VK relay saying this socket HAS NO allocation (anton48
+	// vk-turn-proxy-ios build 432, stand-measured 2026-09-21 over UDP and TCP,
+	// no exception): it expired, was given back, or — after a silence long
+	// enough for a translator on the path to forget the flow — lives on under
+	// the old 5-tuple, out of this socket's reach. The iOS journal has it twice
+	// (2026-09-28, Wi-Fi, the first refresh after freezes of 3m57s and 2m24s).
+	// Either way the stream is dead at the relay now, so it is recycled on the
+	// first such answer rather than after permFailThreshold of them — which,
+	// at 240 s a refresh, would be eight minutes of a "ready" stream that
+	// cannot carry a packet. Anchored on the error-code form, not on a bare
+	// "400": a port number reads the same.
+	permBadRequestMarker = "(error 400:"
 )
 
 // Thresholds are per failure class because pion retries each class on a
@@ -73,6 +88,8 @@ const (
 	// the 60s of margin left under the 300s permission lifetime means one miss
 	// does not yet cost anything. Two ≈ 8 minutes, which is why this stays the
 	// slowest of the three classes and the other two carry the detection.
+	// A miss is a refresh that got no answer or a refusal other than 400; a
+	// 400 is not a miss but the relay's verdict (permBadRequestMarker).
 	permFailThreshold = 2
 )
 
@@ -90,6 +107,18 @@ type permWatch struct {
 	reason atomic.Pointer[string]
 	dead   chan struct{}
 	once   sync.Once
+	// unreachable says the verdict that fired was the relay saying it has no
+	// allocation for this socket — a 400 on CreatePermission, from a
+	// permission refresh or the allocation check — rather than the relay going
+	// silent on the session or refusing it otherwise. Set with the first
+	// reason, before dead is closed; read through sessionBlackhole.
+	//
+	// The two are graded apart (sessionOutcome). A 400 is an answer within a
+	// round trip: the host is up, and what it no longer knows is ours to have
+	// lost — a mapping the translator forgot across a sleep, an allocation
+	// that lapsed in one. The post-wake probe's verdict on the same fact never
+	// counted against the relay; this one stood healthy relays down.
+	unreachable atomic.Bool
 
 	// pion's read loop ending is a different fact from the three above, and is
 	// kept apart from them: it says nothing about the allocation (see
@@ -147,7 +176,7 @@ func (w *permWatch) note(msg string) {
 		return
 	}
 
-	fire := false
+	fire, outOfReach := false, false
 	w.mu.Lock()
 	switch {
 	// Success markers first: a healthy refresh must clear its own counter
@@ -159,30 +188,52 @@ func (w *permWatch) note(msg string) {
 	case strings.Contains(msg, permOKMarker):
 		w.permFails = 0
 	case strings.Contains(msg, allocClosedMarker):
+		// pion's own close after a first ChannelBind answered 400. A failure of
+		// the relay, as it always was, not an out-of-reach verdict: pion writes
+		// it only for the first bind, seconds after the Allocate, where no
+		// translator has had a sleep to forget the flow in; RFC 8656 §12.2
+		// gives ChannelBind 400 to a binding conflict, "no allocation" being
+		// 437; and VK was measured answering 400 that way on CreatePermission
+		// only (anton48 build 432). Unmeasured, it keeps its strike (Codex
+		// review, 23.10).
 		fire = true
 	case strings.Contains(msg, bindFailMarker):
 		w.bindFails++
 		fire = w.bindFails >= bindFailThreshold
 	case strings.Contains(msg, allocFailMarker):
+		// Not a refusal with a code: pion v5.0.13 returns nil from
+		// refreshAllocation on any error response whose code it can read but
+		// 438 (allocation.go, "if err = code.GetFrom(res); err == nil { …
+		// return err }"). So this line is a refresh nothing answered, one that
+		// could not be sent or built, 438s past pion's retries, or a response
+		// it could not read — never an out-of-reach verdict.
 		w.allocFails++
 		fire = w.allocFails >= allocFailThreshold
 	case strings.Contains(msg, permFailMarker):
 		w.permFails++
-		fire = w.permFails >= permFailThreshold
+		outOfReach = strings.Contains(msg, permBadRequestMarker)
+		fire = w.permFails >= permFailThreshold || outOfReach
 	}
 	w.mu.Unlock()
 
 	if fire {
-		w.markDead(msg)
+		w.markDeadAs(msg, outOfReach)
 	}
 }
 
 // markDead latches the blackhole verdict. Idempotent: later failures on a
 // session already declared dead keep the first (root cause) reason.
-func (w *permWatch) markDead(reason string) {
+func (w *permWatch) markDead(reason string) { w.markDeadAs(reason, false) }
+
+// markOutOfReach is markDead for the relay's answer that it has no allocation
+// for this socket (the allocation check, alloc_check.go).
+func (w *permWatch) markOutOfReach(reason string) { w.markDeadAs(reason, true) }
+
+func (w *permWatch) markDeadAs(reason string, outOfReach bool) {
 	w.once.Do(func() {
 		r := reason
 		w.reason.Store(&r)
+		w.unreachable.Store(outOfReach)
 		close(w.dead)
 		turnLog("[STREAM %d] TURN data-path blackhole: %s", w.streamID, reason)
 	})

@@ -144,3 +144,39 @@ func TestDeviceJSONAndTelemetryAgreeOnHardware(t *testing.T) {
 		t.Fatalf("telemetry referrer domain=%v, want the session's page host %s", referrer["domain"], ep.PageHost)
 	}
 }
+
+// Every cursor point of a session falls inside the page its device JSON
+// reports: the slider gesture was laid out for a 1920x1080 screen and started
+// below the page of a 1366x768, 1600x900 or 1536x864 one, and the checkbox walk
+// drifted past both edges of the smallest (Codex review 24.10).
+func TestCaptchaCursorStaysOnThePage(t *testing.T) {
+	type point struct{ X, Y int }
+	check := func(what, raw string, vp captchaViewport) {
+		t.Helper()
+		var points []point
+		if err := json.Unmarshal([]byte(raw), &points); err != nil || len(points) == 0 {
+			t.Fatalf("%s: %v (%s)", what, err, raw)
+		}
+		for _, p := range points {
+			if p.X < 0 || p.X >= vp.Width || p.Y < 0 || p.Y >= vp.InnerHeight {
+				t.Fatalf("%s: point %+v outside the %dx%d page", what, p, vp.Width, vp.InnerHeight)
+			}
+		}
+	}
+	for i := 0; i < 400; i++ {
+		vp := randomViewport()
+		var device struct {
+			InnerHeight       int `json:"innerHeight"`
+			ScreenAvailHeight int `json:"screenAvailHeight"`
+		}
+		if err := json.Unmarshal([]byte(buildCaptchaDeviceJSON(Profile{}, vp)), &device); err != nil {
+			t.Fatal(err)
+		}
+		if device.InnerHeight != vp.InnerHeight || device.ScreenAvailHeight != vp.AvailHeight {
+			t.Fatalf("device JSON says inner %d / avail %d, the session's page is %d / %d",
+				device.InnerHeight, device.ScreenAvailHeight, vp.InnerHeight, vp.AvailHeight)
+		}
+		check("checkbox", generateHumanCursor(vp), vp)
+		check("slider", generateSliderCursor(1+i%5, 5, vp), vp)
+	}
+}

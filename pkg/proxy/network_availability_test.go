@@ -61,7 +61,13 @@ func TestNetworkAvailabilityGateHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestTransportProofKeepsUnvalidatedNetworkAvailable(t *testing.T) {
+// The gateway gone closes the gate at once: what the streams proved a moment
+// ago was proved over a route that no longer exists, and kept, it let workers
+// fetch credentials and allocate on nothing for up to transportPathProofTTL
+// (Codex review 24.10). A host that never saw a gateway (an on-link default
+// route) still opens the gate on fresh proof, and a "no network" that only
+// repeats does not take it away.
+func TestAGatewayLostClosesTheGateDespiteFreshProof(t *testing.T) {
 	resetNetworkAvailabilityForTest()
 	defer resetNetworkAvailabilityForTest()
 
@@ -69,8 +75,14 @@ func TestTransportProofKeepsUnvalidatedNetworkAvailable(t *testing.T) {
 	setNetworkAvailable(true)
 	markNetworkPathProven(generation)
 	setNetworkAvailable(false)
+	if isNetworkAvailable() {
+		t.Fatal("the proof of a path whose gateway is gone kept the gate open")
+	}
+
+	markNetworkPathProven(generation) // a stream gets through all the same
+	setNetworkAvailable(false)        // the next poll
 	if !isNetworkAvailable() {
-		t.Fatal("Android validation loss erased fresh transport proof")
+		t.Fatal("a repeated \"no network\" erased the proof of a path the streams use")
 	}
 }
 
@@ -212,4 +224,33 @@ func TestOldProbePermitCannotReleaseNewProbe(t *testing.T) {
 		t.Fatal("old permit released the active probe")
 	}
 	releaseNetworkPermit(newPermit)
+}
+
+// A probe permit voided while its worker fetched credentials — the gateway back
+// and gone again, a new probe issued — no longer lets that worker dial: two
+// probes at once is what the single permit is there to prevent (Codex review
+// 24.10). An open gate lets every permit through.
+func TestAVoidedProbePermitNoLongerDials(t *testing.T) {
+	resetNetworkAvailabilityForTest()
+	defer resetNetworkAvailabilityForTest()
+
+	beginNetworkPathGeneration()
+	setNetworkAvailable(false)
+	old, ok := waitForNetworkPermit(context.Background(), true)
+	if !ok || !old.unvalidatedProbe || !networkPermitCurrent(old) {
+		t.Fatal("the probe in force cannot dial")
+	}
+	setNetworkAvailable(true)
+	if !networkPermitCurrent(old) {
+		t.Fatal("an open gate held a permit back")
+	}
+	setNetworkAvailable(false)
+	if networkPermitCurrent(old) {
+		t.Fatal("a probe permit voided by the gateway's return and loss still dials")
+	}
+	fresh, ok := waitForNetworkPermit(context.Background(), true)
+	if !ok || !networkPermitCurrent(fresh) {
+		t.Fatal("the probe issued after it cannot dial")
+	}
+	releaseNetworkPermit(fresh)
 }

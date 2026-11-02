@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,12 +56,21 @@ func logf(format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
 	ts := time.Now().In(logLoc).Format("15:04:05.000")
-	line := fmt.Sprintf("[%s] %s\n", ts, fmt.Sprintf(format, args...))
+	line := fmt.Sprintf("[%s] %s\n", ts, stripNUL(fmt.Sprintf(format, args...)))
 	if logFile != nil {
 		_, _ = logFile.WriteString(line)
 	} else {
 		_, _ = fmt.Fprint(os.Stderr, line)
 	}
+}
+
+// stripNUL убирает NUL из строки журнала. Релей VK заканчивает reason phrase
+// STUN-ответа нулём, и текст ошибки pion несёт его в строку: в файле журнала
+// оказывался сырой NUL посреди «(error 400: Bad Request)», а редакторы читают
+// такой файл как двоичный (Android вырезает его по той же причине — там C-строка
+// обрывалась на нём).
+func stripNUL(s string) string {
+	return strings.ReplaceAll(s, "\x00", "")
 }
 
 func turnLog(format string, args ...interface{}) {

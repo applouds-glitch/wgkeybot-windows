@@ -37,6 +37,15 @@ const (
 // since a saturated pool would otherwise flood the log at line rate.
 var dispatchDropCount atomic.Uint64
 
+// What the dispatcher did about streams whose sockets had stopped sending
+// (stream.sendStalled), for the TCP summary (relay_tcp_watch.go): packets it
+// took past such a stream to a sibling, and packets it had to put into one
+// because no other ready stream could take them.
+var (
+	dispatchSteeredCount     atomic.Uint64
+	dispatchIntoStalledCount atomic.Uint64
+)
+
 // anyReady separates the two causes: a saturated pool (every ready stream's
 // queue full) from a pool with nothing ready at all, which is the normal state
 // for the first moments after start.
@@ -54,23 +63,24 @@ func noteDispatchDrop(anyReady bool) {
 
 // TunnelGroupsConfig — configuration for launching multiple WorkerGroups.
 type TunnelGroupsConfig struct {
-	Links           []string
-	PeerAddr        *net.UDPAddr
-	PeerType        string
-	UseUDP          bool
-	TurnIP          string
-	TurnPort        int
-	StreamsPerGroup int
-	// TotalStreams is the stream count to spread over Links. It may be less
-	// than len(Links)*StreamsPerGroup, in which case the last group is short —
-	// StreamsPerGroup is a group's capacity, not its guaranteed size. Zero
-	// means "fill every group", the old behaviour.
-	TotalStreams      int
+	Links       []string
+	PeerAddr    *net.UDPAddr
+	PeerType    string
+	UseUDP      bool
+	TurnIP      string
+	TurnPort    int
+	ExtraRelays []string
+	// GroupStreams gives the size of each group in Links order; it may use
+	// fewer links. Empty means one full-capacity group per link.
+	GroupStreams      []int
 	Cert              *tls.Certificate
 	SessionID         []byte
 	WatchdogTimeout   int
 	WrapKey           []byte // ← добавить: 32 байта = WRAP включён, nil = выключен
 	NetworkGeneration uint64
+	// Start is the evidence of the proxy start the groups run for
+	// (start_outcome.go); nil outside StartProxy.
+	Start *startEvidence
 }
 
 // StartTunnelGroups launches N WorkerGroups concurrently.
@@ -83,11 +93,29 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 	if len(cfg.Links) == 0 {
 		return nil, nil, nil, fmt.Errorf("no links provided")
 	}
-	n := cfg.StreamsPerGroup
-	if n <= 0 {
-		n = streamsPerCredValue()
+	counts := cfg.GroupStreams
+	if len(counts) == 0 {
+		counts = groupStreamCounts(len(cfg.Links), streamsPerCredValue(), 0)
+	}
+	if len(counts) > len(cfg.Links) {
+		return nil, nil, nil, fmt.Errorf("more stream groups than links: %d > %d", len(counts), len(cfg.Links))
+	}
+	totalStreams := 0
+	for gi, count := range counts {
+		if count < 1 {
+			return nil, nil, nil, fmt.Errorf("group %d has invalid stream count %d", gi, count)
+		}
+		totalStreams += count
 	}
 	wd := cfg.WatchdogTimeout
+
+	// The running proxy's state from here to the stream set, claimed only by a
+	// proxy still running (runningProxyMu).
+	runningProxyMu.Lock()
+	if err := ctx.Err(); err != nil {
+		runningProxyMu.Unlock()
+		return nil, nil, nil, err
+	}
 	dispatchDropCount.Store(0)
 
 	gCtx, gCancel := context.WithCancel(ctx)
@@ -105,11 +133,6 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 		})
 	}
 
-	totalStreams := cfg.TotalStreams
-	if totalStreams <= 0 || totalStreams > len(cfg.Links)*n {
-		totalStreams = len(cfg.Links) * n
-	}
-
 	// Terminal-failure accounting: the session is only reported as dead once every
 	// one of these workers has given up for good (see turn_fatal.go).
 	resetWorkerFatalState(totalStreams)
@@ -120,6 +143,7 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 			ctx:             gCtx,
 			id:              i,
 			in:              make(chan []byte, 512),
+			priority:        make(chan []byte, tcpPriorityQueueSize),
 			out:             lc,
 			sessionID:       cfg.SessionID,
 			cert:            cfg.Cert,
@@ -131,8 +155,43 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 			kaPhase:           keepalivePhase(i, totalStreams),
 			wrapTx:            newWrapTxState(), // per-stream RTP SSRC + counter → distinct ChaCha nonce
 			networkGeneration: cfg.NetworkGeneration,
+			// Every peer type that ends at vk-turn-proxy: its WRAP, DTLS and SRTP
+			// paths all answer WGH1. A server that predates it echoes HELLO as a
+			// plain STUN keepalive, never ACKs, and so is never sent a report.
+			feedbackEnabled: cfg.PeerType == "proxy_v2" || cfg.PeerType == "wireguard" || cfg.PeerType == "srtp",
 		}
 	}
+
+	// The reporter's clock first: the judge of silence under load reads it
+	// from its first turn (silentUnderLoadClock).
+	clock := startReporterClock(time.Now())
+	// The set the parked workers look at (path_revival.go) and the tray counts,
+	// and the transport it runs over.
+	claimTransport(relayOverTCP(WorkerGroupConfig{UseUDP: cfg.UseUDP}))
+	withdrawStreams := publishStreams(allStreams)
+	runningProxyMu.Unlock()
+	// One reporter for the whole session UUID, across every credential group:
+	// the server keeps a single downstream-health mask per session.
+	feedbackCtx, feedbackCancel := context.WithCancel(gCtx)
+	feedbackDone := make(chan struct{})
+	go func() {
+		defer close(feedbackDone)
+		runDownlinkFeedback(feedbackCtx, allStreams, clock)
+	}()
+
+	// The downlink loss of each relay, judged against the others; a relay
+	// whose downlink went bad rests and its streams move (relay_rest.go). The
+	// rests an earlier process gave out are read back before any stream picks
+	// its relay (relay_rest_store.go).
+	setRelayRestPeer(cfg.PeerAddr.String())
+	loadRelayRest(time.Now())
+	go runRelayLossJudge(gCtx)
+	// A stream silent under load while its siblings hear their relays leaves
+	// the rotation in seconds, not dispatchStaleAfter (silent_under_load.go).
+	go runSilentUnderLoadJudge(gCtx, allStreams)
+	// The TCP sockets to the relays, sampled while any stream is on one
+	// (relay_tcp_watch.go).
+	go relaySockets.run(gCtx, allStreams)
 
 	var groupsWg sync.WaitGroup
 	// The cascade below sleeps between groups, so it is launched in its own
@@ -148,18 +207,10 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 	groupsWg.Add(1)
 	go func() {
 		defer groupsWg.Done()
-		for gi, link := range cfg.Links {
-			// The last group is short whenever TotalStreams isn't a multiple of n.
-			// Checked before the cascade sleep so a group with nothing to run
-			// doesn't cost 2s on startup.
-			start := gi * n
-			if start >= totalStreams {
-				break
-			}
-			end := start + n
-			if end > totalStreams {
-				end = totalStreams
-			}
+		start := 0
+		for gi, count := range counts {
+			link := cfg.Links[gi]
+			end := start + count
 
 			if gi > 0 {
 				// Cascading group launch (see groupLaunchStagger). Abandoned on
@@ -176,13 +227,15 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 			groupStreams := allStreams[start:end]
 
 			groupCfg := WorkerGroupConfig{
-				GroupID:  gi,
-				Link:     link,
-				PeerAddr: cfg.PeerAddr,
-				UseUDP:   cfg.UseUDP,
-				PeerType: cfg.PeerType,
-				TurnIP:   cfg.TurnIP,
-				TurnPort: cfg.TurnPort,
+				GroupID:     gi,
+				Link:        link,
+				PeerAddr:    cfg.PeerAddr,
+				UseUDP:      cfg.UseUDP,
+				PeerType:    cfg.PeerType,
+				TurnIP:      cfg.TurnIP,
+				TurnPort:    cfg.TurnPort,
+				ExtraRelays: cfg.ExtraRelays,
+				start:       cfg.Start,
 			}
 
 			groupsWg.Add(1)
@@ -191,6 +244,7 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 				WorkerGroup(gCtx, groupCfg, groupStreams)
 			}()
 			turnLog("[INIT] Group %d started (streams %d-%d)", gi, start, end-1)
+			start = end
 		}
 	}()
 
@@ -201,6 +255,9 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 	done := make(chan struct{})
 	go func() {
 		groupsWg.Wait()
+		withdrawStreams()
+		feedbackCancel()
+		<-feedbackDone
 		close(done)
 	}()
 
@@ -214,6 +271,18 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 	go func() {
 		rotor := newChunkRotor(totalStreams)
 		stale := newStaleWatch(totalStreams)
+		// WireGuard's handshake initiation waits while every stream is silent,
+		// until one is proven (dispatch_policy.go thawHold). Released off this
+		// goroutine: no rotor, proven streams first.
+		var hold thawHold
+		sendHeld := func(p []byte, now time.Time) bool {
+			sent, anyReady := dispatchPacket(allStreams, 0, now, p)
+			if !sent {
+				packetPool.Put(p[:cap(p)])
+				noteDispatchDrop(anyReady)
+			}
+			return sent
+		}
 		// Broadcast the WG source addr to every stream so each stream's RX
 		// can forward responses back to WG even if the dispatcher never
 		// picked it for TX. (The server's backendLoop round-robins peer
@@ -257,13 +326,17 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 			for _, line := range stale.observe(allStreams, now) {
 				turnLog("%s", line)
 			}
-			sent, anyReady := dispatchPacket(allStreams, rotor.start(now), now, b[:nRead])
+			if hold.offer(b[:nRead], stale.allStale, now, allStreams, sendHeld) {
+				continue
+			}
+			overTCP := relayOverTCP(WorkerGroupConfig{UseUDP: cfg.UseUDP})
+			sent, anyReady := dispatchPacket(allStreams, rotor.startPacket(now, nRead, overTCP), now, b[:nRead])
 			if !sent {
 				packetPool.Put(b[:cap(b)])
 				noteDispatchDrop(anyReady)
 				continue
 			}
-			rotor.sent(now)
+			rotor.sentPacket(now, nRead, overTCP)
 		}
 	}()
 
@@ -274,14 +347,29 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 // wrapping around, and reports whether it was accepted and whether any stream
 // was ready at all — the two dispatch-drop causes noteDispatchDrop tells apart.
 //
-// Two passes. The first skips streams whose relay has gone quiet
-// (dispatchStale): a stream stays ready until its dead-stream detector fires
-// 90s after the last echo, and the plain round-robin used to keep feeding it
-// every Nth chunk for that whole time — a steady 1/N loss that TCP inside the
-// tunnel reads as congestion. The second pass admits stale streams too, and
-// runs only when the first placed nothing: with every stream silent it is the
-// uplink that is down, not a relay, and placing nothing would only add a drop
-// of our own to whatever the network is already losing.
+// Up to three passes, each run only when the one before placed nothing.
+//
+// The first skips streams whose relay has gone quiet (dispatchStale): a stream
+// stays ready until its dead-stream detector fires 90s after the last echo,
+// and the plain round-robin used to keep feeding it every Nth chunk for that
+// whole time — a steady 1/N loss that TCP inside the tunnel reads as
+// congestion. The second pass admits stale streams: with every stream silent
+// it is the uplink that is down, not a relay, and placing nothing would only
+// add a drop of our own to whatever the network is already losing.
+//
+// Both skip a stream whose TCP socket has stopped moving what we send
+// (sendStalled). Silence does not catch that one: on the network the TCP path
+// exists for, the direction up dies on its own while the relay stays audible
+// (Android field log of 22.09: 45 flows dead in sixteen minutes, not one stream
+// ever judged silent), and each such flow was fed its 1/N until a reset or the
+// system's 30s limit ended it. Only the third pass, run when a stalled socket
+// was passed over and nothing else took the packet, admits one: there is
+// nowhere better, and the packet waits in a socket that may yet move rather
+// than being dropped here (Android 369b1d3b).
+//
+// Over TCP a small packet tries the streams' priority queues first
+// (stream_queue.go), each pass in its own rotation: a stale stream's priority
+// queue must not outrank a fresh stream's ordinary one.
 //
 // Within a pass a full queue is not a drop either: the packet spills to the
 // next candidate, so one stream whose TX goroutine has stalled (a slow relay, a
@@ -290,19 +378,53 @@ func StartTunnelGroups(ctx context.Context, lc net.PacketConn, cfg TunnelGroupsC
 // accepts — and keeps the loss confined to a genuinely saturated pool.
 func dispatchPacket(streams []*stream, start int, now time.Time, pkt []byte) (sent, anyReady bool) {
 	n := len(streams)
-	for pass := 0; pass < 2; pass++ {
+	// skip is each pass's test. It notes a stalled socket passed over: a
+	// placement after one counts as steered, and without one the last pass
+	// would only repeat the second.
+	passedStalled := false
+	skip := func(st *stream, pass int) bool {
+		if pass < 2 && st.sendStalled.Load() {
+			passedStalled = true
+			return true
+		}
+		return pass == 0 && st.dispatchStale(now)
+	}
+	placed := func(st *stream, pass int) (bool, bool) {
+		switch {
+		case pass < 2 && passedStalled:
+			dispatchSteeredCount.Add(1)
+		case pass == 2 && st.sendStalled.Load():
+			dispatchIntoStalledCount.Add(1)
+		}
+		return true, true
+	}
+	for pass := 0; pass < 3; pass++ {
+		if pass == 2 && !passedStalled {
+			break
+		}
+		if len(pkt) <= tcpPriorityPacketSize {
+			for i := 0; i < n; i++ {
+				st := streams[(start+i)%n]
+				if !st.ready.Load() || skip(st, pass) {
+					continue
+				}
+				if st.enqueuePriority(pkt) {
+					return placed(st, pass)
+				}
+			}
+		}
 		for i := 0; i < n; i++ {
 			st := streams[(start+i)%n]
 			if !st.ready.Load() {
 				continue
 			}
 			anyReady = true
-			if pass == 0 && st.dispatchStale(now) {
+			if skip(st, pass) {
 				continue
 			}
 			select {
 			case st.in <- pkt:
-				return true, true
+				return placed(st, pass)
 			default:
 			}
 		}

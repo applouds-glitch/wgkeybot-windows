@@ -66,8 +66,9 @@ const (
 	credRefreshThrottle = 15 * time.Second
 )
 
-// streamsPerCred — number of streams sharing one credential cache slot.
-// Also used as StreamsPerGroup in StartTunnelGroups.
+// streamsPerCred is the configured capacity of one credential group. Groups
+// may be smaller; fetchCreds still maps groupID*streamsPerCred back to groupID.
+// It is also the default group size in StartTunnelGroups.
 //
 // Stored atomically because the proxy start path writes it for the session it is
 // starting while workers of the previous session — cancelled, but not yet
@@ -79,6 +80,19 @@ var streamsPerCred atomic.Int64
 func init() { streamsPerCred.Store(4) }
 
 func streamsPerCredValue() int { return int(streamsPerCred.Load()) }
+
+// MaxStreamsPerCredential is the most streams one credential group carries.
+// VK grants a credential about ten allocations on a relay (relayMoveQuota).
+// A group's streams are spread over its link's relays (assignRelays), but a
+// relay resting or gone puts them all on the ones left, and every stream past
+// the tenth on one relay gets 486 — and with it a credential re-fetch, a
+// captcha's chance, for nothing. StreamNum is not cut by it: groupStreamCounts
+// adds groups instead. Android TurnSettings.MAX_STREAMS_PER_CREDENTIAL.
+const MaxStreamsPerCredential = 10
+
+// clampStreamsPerCred is the capacity a group starts with: at least one
+// stream, at most MaxStreamsPerCredential.
+func clampStreamsPerCred(n int) int { return min(max(n, 1), MaxStreamsPerCredential) }
 
 func setStreamsPerCred(n int) {
 	if n < 1 {
@@ -265,8 +279,9 @@ type getCredsFunc func(context.Context, string, int) (string, string, []string, 
 // getCredsCached checks cache, then calls fn directly. The per-slot cache.mutex
 // serialises concurrent misses for the same slot (single-flight: the first
 // caller fetches, the rest get a cache hit), and vkSemaphore bounds VK API
-// concurrency across slots. Uses the TTL returned by the fetch function to set
-// ExpiresAt, capped at defaultCycleSecs.
+// concurrency across slots — taken here, on a miss and under the slot's lock,
+// and nowhere else (see below). Uses the TTL returned by the fetch function to
+// set ExpiresAt, capped at defaultCycleSecs.
 func getCredsCached(ctx context.Context, link string, streamID int, fn fetchFunc) (string, string, []string, error) {
 	cache := getStreamCache(streamID)
 	cacheID := getCacheID(streamID)
@@ -279,20 +294,46 @@ func getCredsCached(ctx context.Context, link string, streamID int, fn fetchFunc
 	if cache.creds.Link == link && time.Now().Before(cache.creds.ExpiresAt) {
 		return cache.creds.Username, cache.creds.Password, cache.creds.ServerAddrs, nil
 	}
-
-	if !cache.creds.FetchedAt.IsZero() {
-		turnLog("[STREAM %d] Cache miss (cache=%d) — %s, fetching...",
-			streamID, cacheID, cacheMissReason(cache.creds, link, time.Now()))
-	} else {
-		turnLog("[STREAM %d] Cache miss (cache=%d), fetching...", streamID, cacheID)
+	// A worker that waited on the lock above for a fetch the stop cancelled
+	// finds the slot as empty as before, and used to announce a fetch it never
+	// made: a stop during a fetch left one "cache miss, fetching..." per waiting
+	// stream (field log 23.10: eight).
+	if ctx.Err() != nil {
+		return "", "", nil, ctx.Err()
 	}
+
+	// Named by its group: streamID is groupID*streamsPerCred (fetchCreds) — the
+	// first stream of a full-capacity group, and with the smaller groups of
+	// groupStreamCounts a stream that does not exist.
+	if !cache.creds.FetchedAt.IsZero() {
+		turnLog("[Auth] Group %d: cache miss — %s, fetching...",
+			cacheID, cacheMissReason(cache.creds, link, time.Now()))
+	} else {
+		turnLog("[Auth] Group %d: cache miss, fetching...", cacheID)
+	}
+
+	// What vkSemaphore bounds is a request to VK, so it is taken for this one
+	// and not around the lookup above. Held around every lookup — runWorker and
+	// the prefetch used to take it before calling in — a cache hit queued behind
+	// whoever held the two tokens: a slot whose VK fetch can run for minutes (a
+	// captcha the user is solving in the WebView2 window) and a sibling of that
+	// slot waiting on its lock were both, and every worker of every other group
+	// then waited that fetch out before it could read a credential of its own
+	// that was good all along. Taken under the slot's lock, never the other way
+	// round: the lock is what makes the rest of the slot's workers wait for this
+	// fetch instead of making their own, and holding no token while they wait is
+	// the point.
 	select {
+	case vkSemaphore <- struct{}{}:
 	case <-ctx.Done():
 		return "", "", nil, ctx.Err()
-	default:
 	}
-
+	if ctx.Err() != nil { // both were ready, and select picked the token
+		<-vkSemaphore
+		return "", "", nil, ctx.Err()
+	}
 	user, pass, addrs, lifetimeSecs, err := fn(ctx, link)
+	<-vkSemaphore
 	if err != nil {
 		return "", "", nil, err
 	}

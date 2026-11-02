@@ -37,11 +37,22 @@ type App struct {
 	savedConfig      *winbridge.TunnelConfig
 	configError      string
 	activeConfigHash string
-	dashboard        atomic.Uintptr
-	exiting          atomic.Bool
-	actions          chan func()
-	disconnecting    bool
-	blinkMu          sync.Mutex
+	// expertActive — текущее подключение поднято с переопределениями режима
+	// эксперта (a.cfg — уже наложенная копия, см. winbridge.ApplyExpert).
+	expertActive bool
+	dashboard    atomic.Uintptr
+	// expertWindow — открытое окно режима эксперта (0 — закрыто); expertOpening
+	// держится, пока окно создаётся и живёт, чтобы второй клик не открыл второе.
+	expertWindow  atomic.Uintptr
+	expertOpening atomic.Bool
+	// relaySwitchMu — по одному переключению транспорта до релеев за раз
+	// (switchRelayTransport).
+	relaySwitchMu sync.Mutex
+	linkCheck     linkCheckState
+	exiting       atomic.Bool
+	actions       chan func()
+	disconnecting bool
+	blinkMu       sync.Mutex
 
 	mOpen *systray.MenuItem
 
@@ -53,6 +64,9 @@ type App struct {
 	mAutoRefr   *systray.MenuItem
 	mModeVPN    *systray.MenuItem
 	mModeSOCKS  *systray.MenuItem
+	mRelayUDP   *systray.MenuItem
+	mRelayTCP   *systray.MenuItem
+	mExpert     *systray.MenuItem
 	mLog        *systray.MenuItem // nil when not in debug mode
 	mCheckUpd   *systray.MenuItem
 	mAbout      *systray.MenuItem
@@ -83,6 +97,7 @@ const (
 // New creates the tray App. Pass debug=true to enable log file and log menu item.
 func New(debug bool) *App {
 	winbridge.AppVersion = Version
+	winbridge.InitProxyState()
 	return &App{
 		debug:    debug,
 		settings: winbridge.LoadSettings(),
@@ -123,6 +138,11 @@ func (a *App) OnReady() {
 		"Локальный SOCKS5-прокси без захвата системы",
 		a.settings.Mode == winbridge.ModeSOCKS,
 	)
+	mRelay := systray.AddMenuItem("Транспорт до релеев", "Как туннель ходит до TURN-релеев VK")
+	a.mRelayUDP = mRelay.AddSubMenuItemCheckbox("UDP", "Обычно: так быстрее", false)
+	a.mRelayTCP = mRelay.AddSubMenuItemCheckbox("TCP (Ростелеком)",
+		"Если по UDP подключение не поднимается — например, на раздаче с мобильного Ростелекома", false)
+	a.mExpert = systray.AddMenuItem("Режим эксперта...", "Свои MTU, DNS и ссылки VK поверх конфига бота")
 	systray.AddSeparator()
 	a.mCheckUpd = systray.AddMenuItem("Проверить обновление", "Узнать, есть ли новая версия на GitHub")
 	a.mAbout = systray.AddMenuItem("О программе", "")
@@ -134,6 +154,7 @@ func (a *App) OnReady() {
 	a.mQuit = systray.AddMenuItem("Выход", "Закрыть WgKeyBot")
 
 	a.loadConfigInfo()
+	a.refreshRelayChecks()
 	go a.runDashboard()
 	go a.eventLoop()
 
@@ -192,6 +213,12 @@ func (a *App) eventLoop() {
 			a.doSetMode(winbridge.ModeVPN)
 		case <-a.mModeSOCKS.ClickedCh:
 			a.doSetMode(winbridge.ModeSOCKS)
+		case <-a.mRelayUDP.ClickedCh:
+			a.doSetRelayTransport(winbridge.RelayTransportUDP)
+		case <-a.mRelayTCP.ClickedCh:
+			a.doSetRelayTransport(winbridge.RelayTransportTCP)
+		case <-a.mExpert.ClickedCh:
+			a.openExpert()
 		case <-a.mCheckUpd.ClickedCh:
 			go a.doCheckUpdate()
 		case <-a.mAbout.ClickedCh:
@@ -245,6 +272,88 @@ func (a *App) doSetMode(mode winbridge.Mode) {
 	a.refreshModeChecks()
 	if busy {
 		go ShowInfo("Смена режима", "Сначала отключитесь, затем выберите режим.")
+	}
+}
+
+// doSetRelayTransport запоминает выбор транспорта до релеев. Поднятый туннель
+// переходит на него сразу — TURN-транспорт перезапускается под живым WireGuard
+// (winbridge.Manager.SetRelayTransport), — а подключение, которое ещё идёт,
+// возьмёт его в следующий раз.
+func (a *App) doSetRelayTransport(t winbridge.RelayTransport) {
+	a.mu.Lock()
+	a.settings.RelayTransport = t
+	winbridge.SaveSettings(a.settings)
+	mgr := a.manager
+	live := mgr != nil && a.cfg != nil && !a.connecting && !a.disconnecting
+	busy := !live && (mgr != nil || a.connecting || a.disconnecting)
+	if live {
+		a.cfg = winbridge.ApplyRelayTransport(a.cfg, t)
+	}
+	a.mu.Unlock()
+	a.refreshRelayChecks()
+	switch {
+	case live:
+		go a.switchRelayTransport(mgr)
+	case busy:
+		go ShowInfo("Транспорт до релеев", "Применится при следующем подключении.")
+	}
+}
+
+// switchRelayTransport переводит поднятый туннель mgr на транспорт до релеев,
+// выбранный сейчас (a.cfg). Переключения идут по одному, и каждое применяет
+// выбор на момент применения: два быстрых клика иначе гнали две горутины, и
+// последним мог примениться не последний выбор (ревью Codex порта на Windows,
+// 2026-10-23). О результате говорит только переключение, которое что-то
+// поменяло, пока mgr — текущее подключение и выбор с тех пор не сменился: если
+// новый транспорт так и не поднимется, туннель погасит сторож, а
+// переподключится он уже с этим выбором.
+func (a *App) switchRelayTransport(mgr *winbridge.Manager) {
+	a.relaySwitchMu.Lock()
+	defer a.relaySwitchMu.Unlock()
+	a.mu.Lock()
+	current := a.manager == mgr
+	overTCP := winbridge.RelaysOverTCP(a.cfg)
+	a.mu.Unlock()
+	if !current {
+		return
+	}
+	name := "UDP"
+	if overTCP {
+		name = "TCP"
+	}
+	changed, err := mgr.SetRelayTransport(context.Background(), overTCP)
+	a.mu.Lock()
+	current = a.manager == mgr && winbridge.RelaysOverTCP(a.cfg) == overTCP
+	a.mu.Unlock()
+	switch {
+	case !current || !changed:
+	case err != nil:
+		log.Printf("[Tray] relay transport %s: %v", name, err)
+		go Notify("VPN", "Транспорт до релеев "+name+" не поднялся: "+err.Error(), niifWarning)
+	default:
+		go Notify("VPN", "До релеев теперь по "+name, niifInfo)
+	}
+}
+
+// refreshRelayChecks отмечает транспорт до релеев, которым пойдёт (или идёт)
+// туннель: выбранный в трее, а без выбора — из конфига.
+func (a *App) refreshRelayChecks() {
+	a.mu.Lock()
+	tcp := a.settings.RelayTransport == winbridge.RelayTransportTCP
+	if a.settings.RelayTransport == winbridge.RelayTransportAsConfigured {
+		cfg := a.cfg
+		if a.manager == nil || cfg == nil {
+			cfg = a.savedConfig
+		}
+		tcp = winbridge.RelaysOverTCP(cfg)
+	}
+	a.mu.Unlock()
+	if tcp {
+		a.mRelayTCP.Check()
+		a.mRelayUDP.Uncheck()
+	} else {
+		a.mRelayUDP.Check()
+		a.mRelayTCP.Uncheck()
 	}
 }
 
@@ -302,8 +411,13 @@ func (a *App) connect(automatic bool) {
 		return
 	}
 
-	mgr := winbridge.NewManager(cfg)
 	settings := a.settingsSnapshot()
+	// Режим эксперта — на копию: watchdog переподключится с ней же, а
+	// сохранённый конфиг и его хеш остаются такими, какими их выдал бот.
+	cfg, expertOn := winbridge.ApplyExpert(cfg, settings.ExpertSettings())
+	// И транспорт до релеев, выбранный в трее, — на ту же копию.
+	cfg = winbridge.ApplyRelayTransport(cfg, settings.RelayTransport)
+	mgr := winbridge.NewManager(cfg)
 	mgr.SetMode(settings.Mode, settings.SocksPort)
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -315,6 +429,7 @@ func (a *App) connect(automatic bool) {
 	}
 	a.manager = mgr
 	a.cfg = cfg
+	a.expertActive = expertOn
 	a.activeConfigHash = a.settings.LastConfigHash
 	a.cancel = cancel
 	a.mu.Unlock()
@@ -451,7 +566,10 @@ func (a *App) doWatchdogReconnect() {
 
 		if stopped || !retry {
 			a.setDisconnected()
-			if terminal && !stopped {
+			// «VK не отвечает» и «релеи не возят данные» не терминальные —
+			// попытки шли, — но и молча отключаться после них нельзя: пользователь
+			// должен знать, что дело в сети, и что TCP до релеев может помочь.
+			if (terminal || winbridge.IsVKUnreachable(err) || winbridge.IsRelaysCarryNothing(err)) && !stopped {
 				go Notify("VPN", "Не удалось переподключиться: "+err.Error(), niifError)
 			}
 			return
@@ -529,7 +647,7 @@ func (a *App) doTurnFatal(mgr *winbridge.Manager, reason string) {
 func turnFatalMessage(reason string) string {
 	switch {
 	case strings.Contains(reason, "CALL_REQUIRES_AUTH"):
-		return "VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»"
+		return "VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Импорт токена...»"
 	case strings.Contains(reason, "CALL_UNAVAILABLE"):
 		return "VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг"
 	default:
@@ -579,16 +697,16 @@ func (a *App) doImport() {
 		return
 	}
 	defer a.refreshing.Store(false)
-	token, err := InputDialog("WgKeyBot Импорт", "Введите токен WgKeyBot:")
+	raw, err := InputDialog("WgKeyBot Импорт", "Вставьте токен из бота или ссылку с конфигом:")
 	if err != nil {
 		log.Printf("[Tray] input dialog error: %v", err)
 		return
 	}
-	if token == "" {
+	if raw == "" {
 		return
 	}
 
-	data, accessToken, err := winbridge.InitFromToken(token)
+	data, accessToken, err := winbridge.PrepareImport(raw)
 	if err != nil {
 		var upg *winbridge.UpgradeRequiredError
 		if errors.As(err, &upg) {
@@ -802,8 +920,16 @@ func buildTooltip(uptime time.Duration, st winbridge.TunnelStats, settings winbr
 	if settings.Mode == winbridge.ModeSOCKS {
 		header = fmt.Sprintf("SOCKS прокси 127.0.0.1:%d", settings.SocksPort)
 	}
-	// Если рукопожатия не было дольше 3 минут — связь с сервером потеряна.
-	if st.LastHandshake.IsZero() || time.Since(st.LastHandshake) > 3*time.Minute {
+	// Если рукопожатия не было дольше 3 минут — связь с сервером потеряна. А
+	// если сеть есть, но релеи по ней молчат, — так и сказать: туннель тут ни
+	// при чём, ждём ответа релеев. До первого рукопожатия — только
+	// подключение, как и в окне состояния: у него свой срок.
+	switch {
+	case st.LastHandshake.IsZero():
+		header = "Восстановление связи…"
+	case st.RelaysSilent():
+		header = "Релеи не отвечают — ждём ответа"
+	case time.Since(st.LastHandshake) > 3*time.Minute:
 		header = "Восстановление связи…"
 	}
 

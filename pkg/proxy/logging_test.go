@@ -6,6 +6,9 @@
 package proxy
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -33,5 +36,25 @@ func TestLogClockFollowsTheLogZone(t *testing.T) {
 	SetTimezoneOffset(3 * 3600)
 	if got := logClock(at).Format("15:04"); got != "12:00" {
 		t.Fatalf("with a +3h offset: %s, want 12:00", got)
+	}
+}
+
+// Reason phrase релея VK кончается NUL — в файл журнала он попадать не должен.
+func TestLogDropsTheRelaysNUL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.log")
+	SetLogFilePath(path)
+	t.Cleanup(func() { SetLogFilePath("") })
+
+	turnLog("Failed to refresh permissions: %v", "CreatePermission error response (error 400: Bad Request\x00)")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(string(data), 0) {
+		t.Fatalf("NUL in the log: %q", data)
+	}
+	if !strings.Contains(string(data), "(error 400: Bad Request)") {
+		t.Fatalf("the line lost its tail: %q", data)
 	}
 }

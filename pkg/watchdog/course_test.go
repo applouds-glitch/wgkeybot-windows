@@ -12,6 +12,9 @@ type session struct {
 	now       time.Time
 	handshake time.Time
 	tx        uint64
+	silent    bool // прокси не слышит ни одного релея (pathSilent)
+	idle      bool // TX не растёт
+	offline   bool // физической сети нет: опрос — Course.Offline
 }
 
 func newSession(start time.Time) *session {
@@ -20,8 +23,27 @@ func newSession(start time.Time) *session {
 
 func (s *session) poll() Step {
 	s.now = s.now.Add(PollInterval)
-	s.tx += 1000
-	return s.c.Poll(s.now, s.handshake, s.tx)
+	if s.offline {
+		s.c.Offline(s.now)
+		return StepNone
+	}
+	if !s.idle {
+		s.tx += 1000
+	}
+	return s.c.Poll(s.now, s.handshake, s.tx, s.silent)
+}
+
+// untilPastHolds опрашивает мимо удержаний до следующего другого шага; курс,
+// который только и делает, что держит, валит тест.
+func (s *session) untilPastHolds(t *testing.T) (Step, time.Time) {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		if step, at := s.untilStep(t); step != StepHold {
+			return step, at
+		}
+	}
+	t.Fatal("held 20 verdicts in a row")
+	return StepNone, s.now
 }
 
 // untilStep опрашивает, пока что-нибудь не случится; возвращает шаг и момент.
@@ -154,10 +176,130 @@ func TestResumePassesThroughTheCourse(t *testing.T) {
 	s.c.Rebuilt(at)
 
 	s.now = s.now.Add(2 * time.Hour)
-	if step := s.c.Poll(s.now, s.handshake, s.tx); step != StepResumed {
+	if step := s.c.Poll(s.now, s.handshake, s.tx, false); step != StepResumed {
 		t.Fatalf("a two-hour gap read as %v", step)
 	}
 	if s.c.Rebuilds() != 1 {
 		t.Fatalf("rebuilds %d after a resume, want the one already made", s.c.Rebuilds())
+	}
+}
+
+// Тёмные полосы Android 18.10: перезапуск рестартовал прокси в темноту, второй
+// сбрасывал креды ради похода в VK, который не мог пройти. Вместо этого вердикт
+// удерживается — и туннель всё равно гаснет примерно тогда же, когда его
+// погасил бы весь курс.
+func TestVerdictsWhileNoRelayAnswersAreHeldThenTheTunnelGoesDown(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	s := newSession(start)
+	s.handshake = start.Add(5 * time.Second)
+	s.silent = true
+
+	first, firstAt := s.untilStep(t)
+	if first != StepHold {
+		t.Fatalf("первый вердикт при молчащих релеях: %v, want StepHold", first)
+	}
+	step, at := s.untilPastHolds(t)
+	if step != StepTearDown {
+		t.Fatalf("при молчащих релеях: %v, want StepTearDown", step)
+	}
+	if s.c.Rebuilds() != 0 {
+		t.Fatalf("перезапусков при молчащих релеях: %d", s.c.Rebuilds())
+	}
+	if d := at.Sub(firstAt); d < SilentHold || d > SilentHold+PollInterval {
+		t.Fatalf("туннель погашен через %v после удержания, want %v и не больше опроса сверх", d, SilentHold)
+	}
+	if d := at.Sub(s.handshake); d > 10*time.Minute {
+		t.Fatalf("весь курс занял %v, больше десяти минут", d)
+	}
+}
+
+// Удержание не занимает шага курса: когда релеи снова отвечают, а handshake
+// так и нет, берётся тот шаг, что был следующим.
+func TestTheCourseGoesOnFromWhereItWasOnceRelaysAnswer(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	s := newSession(start)
+	s.handshake = start.Add(5 * time.Second)
+	first, at := s.untilStep(t)
+	if first != StepRebuild {
+		t.Fatalf("первый шаг %v, want StepRebuild", first)
+	}
+	s.c.Rebuilt(at)
+
+	s.silent = true
+	if step, _ := s.untilStep(t); step != StepHold {
+		t.Fatalf("новые креды при молчащих релеях: %v, want StepHold", step)
+	}
+	s.silent = false
+	if step, _ := s.untilStep(t); step != StepRebuildNewCreds {
+		t.Fatalf("после того как релеи ответили: %v, want StepRebuildNewCreds", step)
+	}
+}
+
+// Handshake заканчивает удержание, и следующая тишина получает его целиком.
+func TestAHandshakeEndsTheHold(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	s := newSession(start)
+	s.handshake = start.Add(5 * time.Second)
+	s.silent = true
+	_, heldAt := s.untilStep(t)
+
+	s.handshake = heldAt.Add(3 * time.Second)
+	if step := s.poll(); step != StepNone {
+		t.Fatalf("опрос после handshake: %v", step)
+	}
+	again, againAt := s.untilStep(t)
+	if again != StepHold {
+		t.Fatalf("вторая тишина: %v, want StepHold", again)
+	}
+	step, at := s.untilPastHolds(t)
+	if step != StepTearDown || at.Sub(againAt) < SilentHold {
+		t.Fatalf("вторая тишина: %v через %v, want StepTearDown не раньше %v", step, at.Sub(againAt), SilentHold)
+	}
+}
+
+// WireGuard бросает initiation, простой туннель ничего не шлёт, TX не растёт —
+// и ни один опрос больше не выглядит мёртвым: удержание всё равно истекает
+// (Codex review of the Android port, 19.10).
+func TestTheHoldRunsOutWithNothingSent(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	s := newSession(start)
+	s.handshake = start.Add(5 * time.Second)
+	s.silent = true
+	held, heldAt := s.untilStep(t)
+	if held != StepHold {
+		t.Fatalf("первый вердикт: %v, want StepHold", held)
+	}
+	s.idle = true
+	step, at := s.untilStep(t)
+	if step != StepTearDown {
+		t.Fatalf("без трафика: %v, want StepTearDown", step)
+	}
+	if d := at.Sub(heldAt); d < SilentHold || d > SilentHold+PollInterval {
+		t.Fatalf("погашен через %v после удержания, want %v", d, SilentHold)
+	}
+}
+
+// Пропавшая сеть заканчивает удержание; вернувшаяся получает новое целиком, а
+// не остаток старого.
+func TestTheNetworkLostEndsTheHold(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	s := newSession(start)
+	s.handshake = start.Add(5 * time.Second)
+	s.silent = true
+	if step, _ := s.untilStep(t); step != StepHold {
+		t.Fatalf("первый вердикт: %v, want StepHold", step)
+	}
+	s.offline = true
+	for i := 0; i < 20; i++ {
+		s.poll()
+	}
+	s.offline = false
+	step, at := s.untilStep(t)
+	if step != StepHold {
+		t.Fatalf("после возврата сети: %v, want StepHold — удержание пережило пропажу сети", step)
+	}
+	next, nextAt := s.untilStep(t)
+	if next != StepTearDown || nextAt.Sub(at) < SilentHold {
+		t.Fatalf("после возврата сети: %v через %v, want StepTearDown не раньше %v", next, nextAt.Sub(at), SilentHold)
 	}
 }

@@ -273,3 +273,46 @@ func TestWorkerTriesOnceMoreBeforeGivingUpCredsOverA486BesideSilence(t *testing.
 	}
 	waitFor(t, "new credentials after the second such attempt", 14*time.Second, func() bool { return fetches.Load() >= 2 })
 }
+
+// On a network the host does not see — the gateway gone and the path proof with
+// it, an on-link route still carrying — only the minute's probe dials. A
+// credential refusal it meets must still give the credential up: skipped as
+// "offline", every probe after it met the same credential (Codex review 24.10).
+func TestAProbesCredentialRefusalGivesTheCredentialUp(t *testing.T) {
+	resetAllocationBook(t)
+	resetNetworkAvailabilityForTest()
+	defer resetNetworkAvailabilityForTest()
+	resetServerHealth()
+	resetMintBreaker(t) // a pause left by another test's 486s would hold the refresh back
+	const group = 96
+	dropCredSlot(t, group)
+	setNetworkAvailable(false) // the gateway gone: no proof, the probe alone dials
+
+	refuser, _ := startInitialRefusalServer(t, 100, stun.CodeAllocQuotaReached)
+	addr := refuser.LocalAddr().String()
+	fn := func(context.Context, string) (string, string, []string, int, error) {
+		return t.Name(), "pass", []string{addr}, 0, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorkerAgainst(t, ctx, group, addr, fn)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitFor(t, "the probe to meet the refusal", 10*time.Second, func() bool { return refuser.count() >= 1 })
+	waitFor(t, "the refused credential given up", 5*time.Second, func() bool { return credsReplaced(group, t.Name()) })
+}
+
+// resetMintBreaker gives the test a quota breaker that has seen nothing.
+func resetMintBreaker(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		mintBreaker.mu.Lock()
+		mintBreaker.fresh, mintBreaker.trips, mintBreaker.announced = nil, 0, false
+		mintBreaker.lastTrip, mintBreaker.pausedUntil, mintBreaker.lastPause = time.Time{}, time.Time{}, 0
+		mintBreaker.mu.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+}

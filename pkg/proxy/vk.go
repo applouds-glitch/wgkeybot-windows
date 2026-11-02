@@ -287,43 +287,64 @@ func getCustomNetDialer() net.Dialer {
 // Custom dial context that resolves domains via DNS cache and tries every
 // address of the answer — see vk_dial.go.
 func getCustomDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := getCustomNetDialer()
-	return dialVKHost(ctx, hostCache, network, addr, func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// Routed around the VPN before the SYN leaves (bypass.go).
-		if err := ensureBypass(addr); err != nil {
+	return vkDialCounting(nil)(ctx, network, addr)
+}
+
+// vkDialCounting is getCustomDialContext for one VK client: remembered, when
+// set, counts the connections it made on addresses from memory
+// (vk_host_memory.go), which only that client's flow reads.
+func vkDialCounting(remembered *atomic.Uint64) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := getCustomNetDialer()
+		conn, err := dialVKHostCounting(ctx, hostCache, network, addr, func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Routed around the VPN before the SYN leaves (bypass.go).
+			if err := ensureBypass(addr); err != nil {
+				return nil, err
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}, remembered)
+		if err != nil {
 			return nil, err
 		}
-		return dialer.DialContext(ctx, network, addr)
-	})
+		return guardHandshake(conn, vkHandshakeTimeout), nil
+	}
+}
+
+// vkLegacyFirstHost is the first host the legacy chain asks (get_anonym_token).
+const vkLegacyFirstHost = "login.vk.ru"
+
+// vkLegacyHostCheckTimeout bounds vkLegacyHostResolves: one walk of the resolver
+// list, which with every server silent takes ~5s.
+const vkLegacyHostCheckTimeout = 10 * time.Second
+
+// vkLegacyHostResolves settles an own-network failure of the VK Calls flow before
+// the legacy chain is written off. Silence from every resolver about one name
+// need not be the network: a whitelist resolver may drop queries for
+// internal.api.vk.ru and still answer for login.vk.ru, and then the legacy chain
+// is the only way in. If the legacy host resolves now, the chain goes ahead
+// exactly as it did before own-network failures were told apart; if it does not,
+// the chain could only fail on the same DNS — or get through if DNS returned
+// halfway, by the path with the captcha. Asked afresh, never answered from the
+// cache (DnsCache.Refresh): the cache keeps login.vk.ru for as long as the
+// network lasts, and an answer from before the resolvers went silent passed for
+// a resolver that answers now — the chain went out, captcha and all, over a
+// DNS that answered nobody (Android audit 2026-10-16). A success lands in
+// hostCache, so the chain's first dial does not ask again.
+func vkLegacyHostResolves(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, vkLegacyHostCheckTimeout)
+	defer cancel()
+	_, err := hostCache.Refresh(ctx, vkLegacyFirstHost)
+	return err == nil
 }
 
 // fetchVkCreds performs the actual VK/OK API calls to fetch credentials.
 // Returns (username, password, serverAddrs, lifetimeSecs, error).
 func fetchVkCreds(ctx context.Context, link string) (string, string, []string, int, error) {
-	// One identity for the whole session: the UA, the client hints and the
-	// ClientHello all come from the same Chrome major (vkSessionIdentity in
-	// profiles.go), so the transport cannot claim a different browser than the
-	// headers do, and the captcha phase cannot claim a different one than the
-	// phase that triggered it.
-	profile, chromeMajor := vkSessionIdentity()
-
-	client, err := tlsclient.NewHttpClient(
-		tlsclient.NewNoopLogger(),
-		tlsclient.WithTimeoutSeconds(20),
-		// ClientHello matching the session's Chrome major (vk_tls_clienthello.go)
-		// + random extension order: the combination VK's bot detector accepts.
-		tlsclient.WithClientProfile(vkChromeClientProfile(chromeMajor)),
-		tlsclient.WithRandomTLSExtensionOrder(),
-		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
-		tlsclient.WithDialer(getCustomNetDialer()),
-		tlsclient.WithDialContext(getCustomDialContext),
-		// Additive trust: system CAs + bundled Минцифры chain, in case VK/OK
-		// migrate onto Russian roots (see vk_certs.go).
-		tlsclient.WithTransportOptions(&tlsclient.TransportOptions{RootCAs: vkRootCAPool()}),
-	)
-
+	// One identity for the whole session, see newVKAPIClient (vk_link_check.go):
+	// the link check goes to VK through the same client.
+	client, profile, chromeMajor, err := newVKAPIClient()
 	if err != nil {
-		return "", "", nil, 0, fmt.Errorf("failed to create tlsclient: %w", err)
+		return "", "", nil, 0, err
 	}
 	defer client.CloseIdleConnections()
 
@@ -337,16 +358,38 @@ func fetchVkCreds(ctx context.Context, link string) (string, string, []string, i
 		// Credentials in hand — the captcha gate is demonstrably passable again.
 		resetCaptchaLockout()
 		return user, pass, addr, lifetime, nil
+	} else if ctx.Err() != nil {
+		// Stopped mid-flow: the failure is the cancellation's. Below, it read as
+		// a VK Calls failure like any other — "falling back to legacy captcha
+		// path" on every stop during a fetch (field log 23.10) — and the legacy
+		// chain was entered only to fail on the same cancellation.
+		return "", "", nil, 0, ctx.Err()
 	} else if isCallUnavailable(vkErr) {
 		// Dead/deleted call or invalid join link. The legacy captcha chain below
 		// would burn credentials and prompt the user for a captcha that can never
 		// resolve a call that no longer exists — surface as terminal instead.
 		turnLog("[VK Auth] VK Calls: call unavailable (%v) — not falling back to legacy", vkErr)
 		return "", "", nil, 0, vkErr
+	} else if isVKCallsOwnNetwork(vkErr) && !vkLegacyHostResolves(ctx) {
+		// The legacy chain would go out over the same dead network; see
+		// errVKCallsOwnNetwork. The caller retries the whole fetch later.
+		turnLog("[VK Auth] VK Calls flow failed (%v) — not falling back to legacy: %s does not resolve either", vkErr, vkLegacyFirstHost)
+		return "", "", nil, 0, vkErr
+	} else if isVKCallsOwnNetwork(vkErr) {
+		turnLog("[VK Auth] VK Calls flow failed (%v), but %s resolves — falling back to legacy captcha path", vkErr, vkLegacyFirstHost)
 	} else {
 		turnLog("[VK Auth] VK Calls flow failed (%v) — falling back to legacy captcha path", vkErr)
 	}
+	return vkLegacyChain(ctx, link, client, profile)
+}
 
+// vkLegacyChain is fetchVkCredsLegacy; a test replaces it to see whether
+// fetchVkCreds reaches the legacy chain at all.
+var vkLegacyChain = fetchVkCredsLegacy
+
+// fetchVkCredsLegacy is the captcha-gated fallback: the token chain through
+// login.vk.ru and api.vk.ru, rotating the VK app credentials.
+func fetchVkCredsLegacy(ctx context.Context, link string, client tlsclient.HttpClient, profile Profile) (string, string, []string, int, error) {
 	// Guards only the legacy path: if repeated captcha attempts just failed,
 	// there is nothing a full token chain can do except hit the same gate again.
 	if remaining := captchaLockoutRemaining(); remaining > 0 {
@@ -582,12 +625,20 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 	var token2 string
 	var retryErr10 int
 	captchaSolveAttempt := 0 // ladder index for the current captcha (reset after a solve)
+	// The persona attempt of the current captcha (captcha_persona.go): begun at
+	// its first rung, carried to every HTTP solve of it, ended by its token, by
+	// giving up or by an error-10 restart. tokenTry is the attempt whose token
+	// the next request carries, refusedTry the last one whose token VK answered
+	// with another captcha: a chain that does not converge burns that one, not
+	// a persona whose token VK has not seen yet (Codex review 24.10).
+	var captchaTry, tokenTry, refusedTry *captchaAttempt
 	for attempt := 0; ; attempt++ {
 		// Hard bound on the round trip count. Every path that keeps the loop alive
 		// (a solved captcha, an error-10 retry) resets some counter of its own, so
 		// without this the loop has no terminating condition at all — a single
 		// fetch could re-run the solve ladder, window included, indefinitely.
 		if attempt >= maxTokenChainRounds {
+			refusedTry.burn("token chain did not converge")
 			window := bumpCaptchaLockout()
 			turnLog("[STREAM %d] [Captcha] Giving up after %d token-chain rounds — lockout %v", streamID, attempt, window)
 			return "", "", nil, 0, fmt.Errorf("%w: token chain did not converge", errCaptchaUnsolved)
@@ -617,12 +668,19 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				}
 			}
 			if captchaErr != nil && captchaErr.IsCaptchaError() {
+				if tokenTry != nil {
+					refusedTry, tokenTry = tokenTry, nil
+				}
 				// Cached token was rejected — invalidate and retry from base data.
 				if cachedSuccessToken != "" {
 					invalidateCaptchaToken(link)
 					cachedSuccessToken = ""
 					data = baseData
 				}
+				if captchaTry == nil {
+					captchaTry = beginCaptchaAttempt()
+				}
+				solveCtx := withCaptchaAttempt(ctx, captchaTry)
 				solveMode, hasSolveMode := captchaSolveModeForAttempt(captchaSolveAttempt, enableManual, enableManualVisible, autoCaptchaSliderPOC)
 				// If slider POC already failed on a slider-confirmed captcha, the
 				// invisible WebView can't solve it either — skip straight to the
@@ -634,6 +692,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				}
 				if !hasSolveMode {
 					turnLog("[STREAM %d] [Captcha] No more solve modes available (attempt %d)", streamID, captchaSolveAttempt+1)
+					captchaTry.burn("solve ladder exhausted")
 					window := bumpCaptchaLockout()
 					turnLog("[STREAM %d] [Captcha] Solve ladder exhausted — lockout %v", streamID, window)
 					return "", "", nil, 0, fmt.Errorf("%w: solve ladder exhausted", errCaptchaUnsolved)
@@ -646,7 +705,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				case captchaSolveModeAuto:
 					turnLog("[Captcha] Attempt %d. Try auto solving...", attempt+1)
 					if captchaErr.SessionToken != "" && captchaErr.RedirectURI != "" {
-						successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, client, profile, false)
+						successToken, solveErr = solveVkCaptcha(solveCtx, captchaErr, streamID, client, profile, false)
 						if solveErr != nil {
 							turnLog("[STREAM %d] [Captcha] Auto captcha failed: %v", streamID, solveErr)
 						}
@@ -654,7 +713,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 						// now (don't waste a WebView round on a slider it can't solve).
 						if errors.Is(solveErr, errSliderDetected) && autoCaptchaSliderPOC {
 							turnLog("[STREAM %d] [Captcha] Slider detected — escalating to slider POC", streamID)
-							successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, client, profile, true)
+							successToken, solveErr = solveVkCaptcha(solveCtx, captchaErr, streamID, client, profile, true)
 							if solveErr != nil {
 								turnLog("[STREAM %d] [Captcha] Slider POC failed: %v", streamID, solveErr)
 								sliderEscalationFailed = true
@@ -666,7 +725,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				case captchaSolveModeSliderPOC:
 					turnLog("[Captcha] Attempt %d. Try slider solving...", attempt+1)
 					if captchaErr.SessionToken != "" && captchaErr.RedirectURI != "" {
-						successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, client, profile, true)
+						successToken, solveErr = solveVkCaptcha(solveCtx, captchaErr, streamID, client, profile, true)
 						if solveErr != nil {
 							turnLog("[STREAM %d] [Captcha] Auto captcha slider POC failed: %v", streamID, solveErr)
 						}
@@ -690,7 +749,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 						successToken = ""
 						turnLog("[STREAM %d] [Captcha] WebView reported slider — escalating to slider POC", streamID)
 						if captchaErr.SessionToken != "" && captchaErr.RedirectURI != "" {
-							successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, client, profile, true)
+							successToken, solveErr = solveVkCaptcha(solveCtx, captchaErr, streamID, client, profile, true)
 							if solveErr != nil {
 								turnLog("[STREAM %d] [Captcha] Slider POC failed: %v", streamID, solveErr)
 							} else {
@@ -721,6 +780,12 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 					}
 				}
 
+				if solveErr != nil && ctx.Err() != nil {
+					// Stopped mid-rung — a disconnect while the window was open
+					// reads as an empty answer. Our own teardown, not VK's verdict:
+					// no persona burnt, no lockout armed.
+					return "", "", nil, 0, ctx.Err()
+				}
 				if solveErr != nil {
 					turnLog("[STREAM %d] [Captcha] %s failed (attempt %d): %v", streamID, captchaSolveModeLabel(solveMode), captchaSolveAttempt+1, solveErr)
 					captchaSolveAttempt++
@@ -729,6 +794,7 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 						turnLog("[STREAM %d] [Captcha] Falling back to %s...", streamID, captchaSolveModeLabel(nextSolveMode))
 						continue
 					}
+					captchaTry.burn("solve ladder exhausted")
 					window := bumpCaptchaLockout()
 					turnLog("[STREAM %d] [Captcha] Solve ladder exhausted — lockout %v", streamID, window)
 					return "", "", nil, 0, fmt.Errorf("%w: solve ladder exhausted", errCaptchaUnsolved)
@@ -738,7 +804,8 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 					captchaErr.CaptchaAttempt = "1"
 				}
 
-				captchaSolveAttempt = 0 // the next captcha in this chain starts the ladder afresh
+				captchaSolveAttempt = 0                // the next captcha in this chain starts the ladder afresh
+				tokenTry, captchaTry = captchaTry, nil // and is an attempt of its own
 
 				// Resubmit getAnonymousToken with the full captcha context, exactly
 				// like the Android client does. VK needs captcha_sid + captcha_ts +
@@ -780,6 +847,10 @@ func getTokenChain(ctx context.Context, link string, creds VKCredentials, client
 				data = fmt.Sprintf("vk_join_link=https://vk.ru/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
 				baseData = data
 				captchaSolveAttempt = 0
+				// The fresh captcha is an attempt of its own: a stale token or an
+				// expired token1 is no verdict on the persona, so nothing burns,
+				// but the restart must spend the budget like any other captcha.
+				captchaTry, tokenTry = nil, nil
 				attempt = -1 // loop header will increment to 0
 				continue
 			}

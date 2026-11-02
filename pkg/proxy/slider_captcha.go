@@ -46,6 +46,9 @@ type captchaNotRobotSession struct {
 	// componentDoneAt starts the sensors_delay window the check's network
 	// sample count is derived from.
 	componentDoneAt time.Time
+	// bff marks a session of the BFF captcha page (captchaBootstrap.IsBFF): it
+	// opens with initSession, and its check carries no network samples.
+	bff bool
 }
 
 type captchaSettingsResponse struct {
@@ -81,6 +84,15 @@ type captchaBootstrap struct {
 	Difficulty int
 	Settings   *captchaSettingsResponse
 	ScriptURL  string
+	// IsBFF marks the BFF page build (window.isBFF, bff_captcha_rollout): the
+	// widget opens the session with captchaNotRobot.initSession, takes the
+	// captcha types and the slider's opaque settings_key from its answer, and
+	// its check sends no connectionRtt/connectionDownlink. DebugInfo and Lang
+	// come from the page's window.vk (captchaVKGlobal): the script URL
+	// fetchDebugInfoFromScript reads is gone from that build.
+	IsBFF     bool
+	DebugInfo string
+	Lang      string
 	// PowV2 marks the current page format, where the captcha page embeds an
 	// obfuscated inline PoW solver that receives the challenge as IIFE arguments
 	// and expects the check's hash param to be a "v2."-prefixed payload instead
@@ -98,11 +110,14 @@ func newCaptchaNotRobotSession(
 	client tlsclient.HttpClient,
 	profile Profile,
 ) *captchaNotRobotSession {
-	// One viewport, one browser_fp and one adFp for the whole session — the old
-	// code called randomViewport() per request, so the device JSON could
-	// contradict the browser_fp derived from a different viewport.
-	vp := randomViewport()
-	browserFp := generateBrowserFp(profile, vp)
+	// One viewport, one browser_fp and one adFp for the whole session, all the
+	// persona's (captcha_persona.go) — the old code called randomViewport() per
+	// request, so the device JSON could contradict the browser_fp derived from a
+	// different viewport. Kept for the session even if the persona is burnt
+	// meanwhile: the slider after a BOT check is this same session.
+	persona := captchaPersonaFor(ctx)
+	vp := captchaViewportFor(persona)
+	browserFp := persona.browserFp
 	return &captchaNotRobotSession{
 		ctx:          ctx,
 		sessionToken: sessionToken,
@@ -166,6 +181,20 @@ func (s *captchaNotRobotSession) request(method string, values neturl.Values) (m
 	return resp, nil
 }
 
+// BFF creates the session before settings/componentDone and returns the opaque
+// settings keys used by getContent. Do not repeat initSession on slider fallback.
+func (s *captchaNotRobotSession) requestInitSession(lang string) (*captchaSettingsResponse, error) {
+	if lang == "" {
+		lang = "0"
+	}
+	values := neturl.Values{"session_token": {s.sessionToken}, "domain": {s.endpoints.Domain}, "lang": {lang}, "access_token": {""}}
+	resp, err := s.request("captchaNotRobot.initSession", values)
+	if err != nil {
+		return nil, fmt.Errorf("initSession failed: %w", err)
+	}
+	return parseCaptchaSettingsResponse(resp)
+}
+
 func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, error) {
 	resp, err := s.request("captchaNotRobot.settings", s.baseValues())
 	if err != nil {
@@ -200,7 +229,7 @@ func (s *captchaNotRobotSession) requestCheckboxCheck() (*captchaCheckResult, er
 	// A checkbox check models a tap/click, not a slider drag — use the same
 	// human-like cursor trajectory the standalone checkbox solver used so the
 	// in-session checkbox attempt scores no worse than the old separate path.
-	return s.requestCheck(generateHumanCursor(), base64.StdEncoding.EncodeToString([]byte("{}")))
+	return s.requestCheck(generateHumanCursor(s.viewport), base64.StdEncoding.EncodeToString([]byte("{}")))
 }
 
 func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*sliderCaptchaContent, error) {
@@ -230,7 +259,7 @@ func (s *captchaNotRobotSession) requestSliderCheck(activeSteps []int, candidate
 		return nil, err
 	}
 
-	return s.requestCheck(generateSliderCursor(candidateIndex, candidateCount), answer)
+	return s.requestCheck(generateSliderCursor(candidateIndex, candidateCount, s.viewport), answer)
 }
 
 func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*captchaCheckResult, error) {
@@ -241,14 +270,17 @@ func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*ca
 	values.Set("cursor", cursor)
 	values.Set("taps", "[]")
 	// Network samples: one per 200ms sensors_delay tick since componentDone, so
-	// the count stays honest for however long the slider stage took.
-	sampleCount := 1
-	if !s.componentDoneAt.IsZero() {
-		sampleCount = int(time.Since(s.componentDoneAt).Milliseconds() / 200)
+	// the count stays honest for however long the slider stage took. The BFF
+	// widget sends none.
+	if !s.bff {
+		sampleCount := 1
+		if !s.componentDoneAt.IsZero() {
+			sampleCount = int(time.Since(s.componentDoneAt).Milliseconds() / 200)
+		}
+		connRtt, connDownlink := generateNetworkSamples(sampleCount)
+		values.Set("connectionRtt", connRtt)
+		values.Set("connectionDownlink", connDownlink)
 	}
-	connRtt, connDownlink := generateNetworkSamples(sampleCount)
-	values.Set("connectionRtt", connRtt)
-	values.Set("connectionDownlink", connDownlink)
 	values.Set("browser_fp", s.browserFp)
 	values.Set("hash", s.hash)
 	values.Set("answer", answer)
@@ -278,15 +310,31 @@ func callCaptchaNotRobotWithSliderPOC(
 	profile Profile,
 	initialSettings *captchaSettingsResponse,
 	endpoints captchaEndpoints,
+	bootstrap ...*captchaBootstrap,
 ) (string, error) {
 	session := newCaptchaNotRobotSession(ctx, sessionToken, endpoints, hash, debugInfo, streamID, client, profile)
+
+	if len(bootstrap) > 0 && bootstrap[0] != nil && bootstrap[0].IsBFF {
+		session.bff = true
+		initSettings, err := session.requestInitSession(bootstrap[0].Lang)
+		if err != nil {
+			return "", err
+		}
+		initialSettings = mergeCaptchaSettings(initSettings, initialSettings)
+	}
 
 	turnLog("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	settingsResp, err := session.requestSettings()
 	if err != nil {
 		return "", err
 	}
-	settingsResp = mergeCaptchaSettings(settingsResp, initialSettings)
+	// initSession's settings_key is what getContent asks for on a BFF session:
+	// it wins over whatever settings says for the same type.
+	if session.bff {
+		settingsResp = mergeCaptchaSettings(initialSettings, settingsResp)
+	} else {
+		settingsResp = mergeCaptchaSettings(settingsResp, initialSettings)
+	}
 
 	time.Sleep(time.Duration(500+mathrand.Intn(300)) * time.Millisecond)
 
@@ -383,7 +431,17 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 	}
 	settings.ShowCaptchaType, _ = respObj["show_captcha_type"].(string)
 
-	rawSettings, ok := expandCaptchaSettings(respObj["captcha_settings"])
+	if status, _ := respObj["status"].(string); status != "" && status != "OK" {
+		if status == "ERROR_LIMIT" {
+			return nil, errCaptchaRateLimit
+		}
+		return nil, fmt.Errorf("settings status: %s", status)
+	}
+	raw := respObj["content_settings"]
+	if raw == nil {
+		raw = respObj["captcha_settings"]
+	}
+	rawSettings, ok := expandCaptchaSettings(raw)
 	if !ok {
 		return settings, nil
 	}
@@ -399,7 +457,11 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 			continue
 		}
 
-		normalized, err := normalizeCaptchaSettings(item["settings"])
+		value := item["settings"]
+		if key, _ := item["settings_key"].(string); key != "" {
+			value = key
+		}
+		normalized, err := normalizeCaptchaSettings(value)
 		if err != nil {
 			return nil, fmt.Errorf("invalid captcha_settings for %s: %w", captchaType, err)
 		}
@@ -425,6 +487,14 @@ var (
 
 func parseCaptchaBootstrapHTML(html string) (*captchaBootstrap, error) {
 	bootstrap := &captchaBootstrap{Difficulty: 2}
+	block := captchaVKGlobal(html)
+	bootstrap.IsBFF = block != "" || regexp.MustCompile(`window\.isBFF\s*=\s*true`).MatchString(html)
+	if m := regexp.MustCompile(`(?:["']?[\w$]+["']?)\s*:\s*["']([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})["']`).FindStringSubmatch(block); len(m) > 1 {
+		bootstrap.DebugInfo = m[1]
+	}
+	if m := regexp.MustCompile(`["']?\blang["']?\s*:\s*["']?(\d+)`).FindStringSubmatch(block); len(m) > 1 {
+		bootstrap.Lang = m[1]
+	}
 
 	// The v2 solver is the inline script that writes window.captchaPowResult.
 	for _, scriptMatch := range reInlineScript.FindAllStringSubmatch(html, -1) {
@@ -1132,11 +1202,11 @@ func pixelDiff(left color.Color, right color.Color) int64 {
 	return dr + dg + db
 }
 
-func generateSliderCursor(candidateIndex int, candidateCount int) string {
-	return buildSliderCursor(candidateIndex, candidateCount)
+func generateSliderCursor(candidateIndex int, candidateCount int, vp captchaViewport) string {
+	return buildSliderCursor(candidateIndex, candidateCount, vp)
 }
 
-func buildSliderCursor(candidateIndex int, candidateCount int) string {
+func buildSliderCursor(candidateIndex int, candidateCount int, vp captchaViewport) string {
 	if candidateCount <= 0 {
 		return "[]"
 	}
@@ -1209,6 +1279,21 @@ func buildSliderCursor(candidateIndex int, candidateCount int) string {
 		})
 	}
 
+	// The coordinates above are laid out for a 1920x1080 screen, whose page is
+	// ~940px high; the gesture starts as low as y≈910. On a smaller page the
+	// whole gesture moves up (or left) until it fits, keeping its shape, and
+	// whatever still sticks out — a page too small for it — is held at the
+	// edge (clampToPage).
+	maxX, maxY := 0, 0
+	for _, p := range points {
+		maxX, maxY = max(maxX, p.X), max(maxY, p.Y)
+	}
+	dx := min(0, vp.Width-1-cursorPageMargin-maxX)
+	dy := min(0, vp.InnerHeight-1-cursorPageMargin-maxY)
+	for i := range points {
+		points[i].X, points[i].Y = clampToPage(points[i].X+dx, points[i].Y+dy, vp)
+	}
+
 	data, err := json.Marshal(points)
 	if err != nil {
 		return "[]"
@@ -1270,4 +1355,38 @@ func describeCaptchaTypes(settingsByType map[string]string) string {
 	}
 	sort.Strings(types)
 	return strings.Join(types, ",")
+}
+
+// Bound metadata lookup to window.vk, respecting braces inside quoted strings.
+// The property carrying debug_info is renamed between widget builds.
+func captchaVKGlobal(page string) string {
+	loc := regexp.MustCompile(`window\.vk\s*=\s*\{`).FindStringIndex(page)
+	if loc == nil {
+		return ""
+	}
+	start, depth := loc[1]-1, 0
+	var quote byte
+	for i := start; i < len(page); i++ {
+		ch := page[i]
+		if quote != 0 {
+			if ch == '\\' {
+				i++
+			} else if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return page[start : i+1]
+			}
+		}
+	}
+	return ""
 }

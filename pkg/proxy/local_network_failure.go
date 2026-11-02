@@ -7,6 +7,7 @@ package proxy
 
 import (
 	"errors"
+	"syscall"
 	"time"
 )
 
@@ -31,8 +32,11 @@ import (
 // What stays the relay's: a refusal, silence on a network that stayed
 // (timeouts), a reset, any TURN error. An unblamed relay costs an attempt that
 // fails fast; a blamed healthy one cost five minutes.
-func localNetworkError(err error) bool {
-	for _, errno := range localNetworkErrnos {
+func localNetworkError(err error) bool { return errnoIn(err, localNetworkErrnos) }
+
+// errnoIn reports whether err carries one of errnos.
+func errnoIn(err error, errnos []syscall.Errno) bool {
+	for _, errno := range errnos {
 		if errors.Is(err, errno) {
 			return true
 		}

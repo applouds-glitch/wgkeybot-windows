@@ -135,7 +135,7 @@ func TestDispatchStaleThreshold(t *testing.T) {
 	}
 }
 
-// The handshake bound is what lets the election act inside StartProxy's 30s
+// The handshake bound is what lets the demotion act inside StartProxy's 30s
 // startup timeout on the DTLS peer types — a handshake that times out on one
 // relay plus the reconnect onto the other must both fit — and it must still
 // leave pion/dtls its first few retransmits (flights at 0s, 1s, 3s, 7s).
@@ -268,5 +268,26 @@ func TestStaleWatchRateLimitsScans(t *testing.T) {
 	}
 	if lines := w.observe(streams, now.Add(staleWatchInterval)); len(lines) != 2 {
 		t.Fatalf("next scan missed the recovery: %q", lines)
+	}
+}
+
+// The dispatcher trusts a stream on a real echo. A thaw resets the detector's
+// clock for every stream at once; it must not put a stream whose mapping died
+// in the freeze back into the rotation for 35 s.
+func TestDispatchTrustsARealEchoNotTheFreezeReset(t *testing.T) {
+	now := time.Now()
+	s := &stream{id: 5}
+	a := newStreamActivity(now.Add(-time.Minute), 0)
+	s.activity.Store(a)
+	if !s.dispatchStale(now) {
+		t.Fatal("a stream silent for a minute is not stale")
+	}
+	a.resetLiveness(now)
+	if !s.dispatchStale(now) {
+		t.Fatal("the freeze reset made a silent stream look heard")
+	}
+	a.noteRx(now)
+	if s.dispatchStale(now) {
+		t.Fatal("a real echo did not bring the stream back")
 	}
 }

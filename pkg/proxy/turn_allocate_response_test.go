@@ -67,7 +67,7 @@ func TestInitialAllocateErrorMatchesTransactionOverTCP(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, _, _, _, _, err = dialAndAllocate(ctx, &stream{}, t.Name(), "pass", l.Addr().String(), WorkerGroupConfig{})
+	_, _, _, _, _, err = dialAndAllocate(ctx, &stream{}, t.Name(), "pass", l.Addr().String(), WorkerGroupConfig{}, dialOpts{})
 	if code, ok := turnErrorCode(err); !ok || code != stun.CodeAllocMismatch {
 		t.Fatalf("unrelated transaction replaced actual 437: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestDialAndAllocateIgnoresUnrelatedDatagrams(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	client, raw, relay, _, perm, err := dialAndAllocate(ctx, &stream{}, "noisy-user", "pass", pc.LocalAddr().String(), WorkerGroupConfig{UseUDP: true})
+	client, raw, relay, _, perm, err := dialAndAllocate(ctx, &stream{}, "noisy-user", "pass", pc.LocalAddr().String(), WorkerGroupConfig{UseUDP: true}, dialOpts{})
 	if err != nil {
 		t.Fatalf("Allocate lost after unrelated datagram: %v (server allocations: %d, injected: %d)", err, server.AllocationCount(), noisy.injected.Load())
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/getlantern/systray"
 	"github.com/wgkeybot/windows/tray"
+	"github.com/wgkeybot/windows/winbridge"
 	"golang.org/x/sys/windows"
 )
 
@@ -33,6 +34,8 @@ func main() {
 			debug = true
 		}
 	}
+
+	winbridge.InitCrashOutput(debug)
 
 	app := tray.New(debug)
 	systray.Run(app.OnReady, app.OnExit)

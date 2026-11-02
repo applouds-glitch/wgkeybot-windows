@@ -7,6 +7,7 @@ package proxy
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,10 @@ const (
 	// closed and the next packet starts its search on the next stream.
 	chunkMaxAge = time.Second
 
+	// TCP paths can have different RTTs. Larger batches reduce path changes
+	// for bulk traffic, while this bound prevents an idle batch holding a path.
+	tcpChunkMaxAge = 15 * time.Millisecond
+
 	// staleWatchInterval bounds how often the dispatcher re-scans every stream
 	// for stale transitions. Transitions are logged, not the scans, so this only
 	// caps the atomic loads per packet under load; at idle every packet scans.
@@ -40,6 +45,7 @@ type chunkRotor struct {
 	cur        int
 	inChunk    int
 	chunkStart time.Time
+	smallNext  int // independent rotation for priority packets over TCP
 }
 
 func newChunkRotor(n int) *chunkRotor {
@@ -48,7 +54,11 @@ func newChunkRotor(n int) *chunkRotor {
 
 // start returns the stream index to dispatch from, closing an idle chunk first.
 func (r *chunkRotor) start(now time.Time) int {
-	if r.inChunk > 0 && now.Sub(r.chunkStart) >= chunkMaxAge {
+	return r.startWithin(now, chunkMaxAge)
+}
+
+func (r *chunkRotor) startWithin(now time.Time, maxAge time.Duration) int {
+	if r.inChunk > 0 && now.Sub(r.chunkStart) >= maxAge {
 		r.advance()
 	}
 	return r.cur
@@ -56,12 +66,59 @@ func (r *chunkRotor) start(now time.Time) int {
 
 // sent records a packet placed on the current chunk.
 func (r *chunkRotor) sent(now time.Time) {
+	r.sentWithin(now, chunkSize)
+}
+
+func (r *chunkRotor) sentWithin(now time.Time, limit int) {
 	if r.inChunk == 0 {
 		r.chunkStart = now
 	}
 	r.inChunk++
-	if r.inChunk >= chunkSize {
+	if r.inChunk >= limit {
 		r.advance()
+	}
+}
+
+// startPacket is start for a packet of size over the transport. Over TCP small
+// packets take their own rotation without breaking bulk affinity — size is
+// only a priority heuristic, WireGuard has already encrypted TCP headers — and
+// bulk goes in chunks sized by the packet (tcpChunkSize) that close sooner
+// (Android 993dba30).
+func (r *chunkRotor) startPacket(now time.Time, size int, overTCP bool) int {
+	if overTCP {
+		if size <= tcpPriorityPacketSize {
+			return r.smallNext
+		}
+		return r.startWithin(now, tcpChunkMaxAge)
+	}
+	return r.start(now)
+}
+
+func (r *chunkRotor) sentPacket(now time.Time, size int, overTCP bool) {
+	if overTCP {
+		if size <= tcpPriorityPacketSize {
+			r.smallNext = (r.smallNext + 1) % r.n
+			return
+		}
+		r.sentWithin(now, tcpChunkSize(size))
+		return
+	}
+	r.sent(now)
+}
+
+// tcpChunkSize is how many packets of size a chunk over TCP takes: the larger
+// the packet, the more of them in a row on one stream — bulk is what suffers
+// most from being spread over paths of different RTTs.
+func tcpChunkSize(size int) int {
+	switch {
+	case size > 1100:
+		return 64
+	case size >= 701:
+		return 24
+	case size >= 301:
+		return 8
+	default:
+		return 3
 	}
 }
 
@@ -76,15 +133,21 @@ func (r *chunkRotor) advance() {
 // was the dead-stream detector 90s later — and a relay outage looked exactly
 // like an uplink outage until then. The "every stream" line is what tells them
 // apart: one dead allocation stales one stream while its siblings keep hearing
-// echoes; a dead uplink stales all of them at once.
+// echoes; a dead uplink stales all of them at once. A stream found silent under
+// load has its lines, with the witnesses and their packets, from the judge that
+// found it (silent_under_load.go), the return too: that judge sees the return
+// on its own turn, while a scan here may miss an episode shorter than its
+// interval altogether.
 type staleWatch struct {
 	stale    []bool
+	early    []bool            // stale by the judge of silence under load, whose lines they are
+	acts     []*streamActivity // the session each stream's stale and early are about
 	allStale bool
 	lastScan time.Time
 }
 
 func newStaleWatch(n int) *staleWatch {
-	return &staleWatch{stale: make([]bool, n)}
+	return &staleWatch{stale: make([]bool, n), early: make([]bool, n), acts: make([]*streamActivity, n)}
 }
 
 // observe re-evaluates every stream at most once per staleWatchInterval and
@@ -100,11 +163,22 @@ func (w *staleWatch) observe(streams []*stream, now time.Time) []string {
 	for i, st := range streams {
 		if !st.ready.Load() {
 			// A torn-down stream leaves the picture without a line of its own:
-			// the dead-stream detector or the worker already said why.
-			w.stale[i] = false
+			// the dead-stream detector or the worker already said why. A
+			// verdict of silence under load it died under went with its
+			// session: the next session's lines are the watch's own until
+			// the judge speaks on it again (review 2026-10-22).
+			w.stale[i], w.early[i] = false, false
 			continue
 		}
 		ready++
+		// So does a session begun since the last scan with the stream never
+		// seen down in between: scans are a second apart at the least, and
+		// only while the dispatcher has packets (codex review 2026-10-22).
+		a := st.activity.Load()
+		if a != w.acts[i] {
+			w.acts[i] = a
+			w.stale[i], w.early[i] = false, false
+		}
 		isStale := st.dispatchStale(now)
 		if isStale {
 			stale++
@@ -113,11 +187,22 @@ func (w *staleWatch) observe(streams []*stream, now time.Time) []string {
 			continue
 		}
 		w.stale[i] = isStale
-		if isStale {
-			lines = append(lines, fmt.Sprintf("[DISPATCH] stream %d silent for %v — skipped while siblings hear echoes",
-				st.id, st.activity.Load().rxAge(now).Round(time.Second)))
-		} else {
+		switch {
+		case !isStale:
+			if w.early[i] {
+				w.early[i] = false // the judge reports the return
+				continue
+			}
 			lines = append(lines, fmt.Sprintf("[DISPATCH] stream %d heard its relay again — back in rotation", st.id))
+		case a.foundSilentUnderLoad():
+			w.early[i] = true // the judge has said why, with the numbers
+		default:
+			lines = append(lines, fmt.Sprintf("[DISPATCH] stream %d silent for %v — skipped while siblings hear echoes",
+				st.id, a.heardAge(now).Round(time.Second)))
+			// Over TCP, what the socket looked like at that moment (nothing over UDP).
+			if line := relaySockets.silentSocketLine(st); line != "" {
+				lines = append(lines, line)
+			}
 		}
 	}
 
@@ -125,10 +210,106 @@ func (w *staleWatch) observe(streams []*stream, now time.Time) []string {
 	if allStale != w.allStale {
 		w.allStale = allStale
 		if allStale {
-			lines = append(lines, fmt.Sprintf("[DISPATCH] every ready stream (%d) is silent — the uplink is dark, not a relay; dispatching to all of them", ready))
+			lines = append(lines, fmt.Sprintf("[DISPATCH] every ready stream (%d) is silent — the uplink or relay paths are dark; dispatching to all of them", ready))
 		} else if ready > 0 {
 			lines = append(lines, fmt.Sprintf("[DISPATCH] relay echoes are back on %d of %d streams", ready-stale, ready))
 		}
 	}
 	return lines
+}
+
+// thawHold keeps WireGuard's handshake initiation while every ready stream is
+// silent — the moment after a thaw. iOS field 2026-09-28, build 10, Wi-Fi:
+// after freezes of 1m18s and 2m43s every allocation was dead, the initiation
+// sent at the thaw was lost, and WireGuard asked again only at RekeyTimeout,
+// 5 s at a time, seven times in a row. The one packet the tunnel's recovery
+// hangs on is released the moment one stream has heard its relay (the probe's
+// echo, a fresh session's proof) — the dispatcher then prefers that stream — or
+// after thawHoldMax through whatever is there. Only the newest initiation is
+// kept; every other packet is dispatched as always (a data packet into a dead
+// stream costs its sender a retransmit, an initiation costs the tunnel five
+// seconds).
+const (
+	thawHoldPoll = 50 * time.Millisecond
+)
+
+// Vars so that a test can shrink them; nothing else writes them.
+var thawHoldMax = 2500 * time.Millisecond
+
+// isWireGuardInitiation: a handshake initiation (message type 1, 148 bytes).
+func isWireGuardInitiation(pkt []byte) bool {
+	return len(pkt) == 148 && pkt[0] == 1 && pkt[1] == 0 && pkt[2] == 0 && pkt[3] == 0
+}
+
+// anyStreamProven: some ready stream has heard its relay within
+// dispatchStaleAfter — the moment a held initiation may go.
+func anyStreamProven(streams []*stream, now time.Time) bool {
+	for _, st := range streams {
+		if st.ready.Load() && !st.dispatchStale(now) {
+			return true
+		}
+	}
+	return false
+}
+
+type thawHold struct {
+	mu      sync.Mutex
+	held    []byte
+	since   time.Time
+	holding bool
+}
+
+// offer takes pkt (a pooled buffer) if it is to be held, and reports whether
+// it did; a packet not taken is the caller's to dispatch. send dispatches a
+// released packet and owns its buffer from then on. Called with the caller's
+// dispatch lock held; release never calls send under h.mu, so send may take
+// that lock.
+func (h *thawHold) offer(pkt []byte, allSilent bool, now time.Time, streams []*stream, send func(pkt []byte, now time.Time) bool) bool {
+	if !allSilent || !isWireGuardInitiation(pkt) {
+		return false
+	}
+	h.mu.Lock()
+	if h.held != nil {
+		packetPool.Put(h.held[:cap(h.held)]) // only the newest initiation matters
+	}
+	h.held = pkt
+	start := !h.holding
+	if start {
+		h.holding = true
+		h.since = now
+	}
+	h.mu.Unlock()
+	if start {
+		go h.release(streams, send)
+	}
+	return true
+}
+
+func (h *thawHold) release(streams []*stream, send func([]byte, time.Time) bool) {
+	ticker := time.NewTicker(thawHoldPoll)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		proven := anyStreamProven(streams, now)
+		h.mu.Lock()
+		waited := now.Sub(h.since)
+		if !proven && waited < thawHoldMax {
+			h.mu.Unlock()
+			continue
+		}
+		pkt := h.held
+		h.held, h.holding = nil, false
+		h.mu.Unlock()
+		if pkt == nil {
+			return
+		}
+		sent := send(pkt, now)
+		why := "a stream has heard its relay"
+		if !proven {
+			why = "no stream proved itself in time"
+		}
+		turnLog("[DISPATCH] WireGuard handshake initiation held %v while every stream was silent — %s, sent=%v",
+			waited.Round(10*time.Millisecond), why, sent)
+		return
+	}
 }

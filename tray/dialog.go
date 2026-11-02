@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/wgkeybot/windows/pkg/connlink"
 	"golang.org/x/sys/windows"
 )
 
@@ -23,16 +24,18 @@ func InputDialog(title, prompt string) (string, error) {
 	defer w.dispose()
 	w.label(prompt, 20, 18, 432, 24, 0)
 	edit := w.add("EDIT", "", 0x00800000|0x0080|wsTabstop, 0, 20, 50, 432, 28, 0)
-	pSendMessage.Call(edit.hwnd, 0x00c5, 4096, 0) // EM_SETLIMITTEXT
+	// Ссылка с конфигом намного длиннее токена. Что не влезло, обрежется и
+	// получит ошибку «скопировано не полностью».
+	pSendMessage.Call(edit.hwnd, 0x00c5, connlink.MaxLinkLength, 0) // EM_SETLIMITTEXT
 	w.add("BUTTON", "Импортировать", 1|wsTabstop, 1, 196, 100, 150, 32, 0)
 	w.add("BUTTON", "Отмена", wsTabstop, 2, 356, 100, 96, 32, 0)
 	var result string
 	w.command = func(id int) {
 		switch id {
 		case 1:
-			var buf [4097]uint16
+			buf := make([]uint16, connlink.MaxLinkLength+1)
 			pGetWindowText.Call(edit.hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-			result = strings.TrimSpace(windows.UTF16ToString(buf[:]))
+			result = strings.TrimSpace(windows.UTF16ToString(buf))
 			pDestroyWindow.Call(w.hwnd)
 		case 2:
 			pDestroyWindow.Call(w.hwnd)

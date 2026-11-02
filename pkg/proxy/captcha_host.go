@@ -55,6 +55,8 @@ func RequestCaptcha(ctx context.Context, redirectURI string) string {
 // timeout <= 0 означает «без таймаута» (ждать до ответа или отмены ctx).
 func RequestCaptchaCtx(ctx context.Context, redirectURI string, timeout time.Duration) string {
 	ch := make(chan string, 1)
+	// The start's window runs out on the user, not on the relays (start_outcome.go).
+	noteStartCaptcha()
 
 	captchaMu.Lock()
 	if captchaAnswerCh != nil {

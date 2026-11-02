@@ -1,9 +1,11 @@
 package winbridge
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wgkeybot/windows/pkg/crashlog"
 	"github.com/wgkeybot/windows/pkg/proxy"
 	"github.com/wgkeybot/windows/pkg/watchdog"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -32,8 +35,55 @@ func InitLogging() {
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err == nil {
-		log.SetOutput(f)
+		log.SetOutput(nulFreeWriter{f})
 	}
+}
+
+// crashLogLimit — за этим размером crash.log при старте уезжает в crash.log.old.
+// Паника пишет сообщение и стек паникующей горутины — килобайты, так что предел
+// достигается только серией падений.
+const crashLogLimit = 1 << 20
+
+// InitCrashOutput направляет паники и fatal error Go в файл (pkg/crashlog): с
+// --debug — в wgkeybot.log, следом за строками журнала, без него — в
+// crash.log, потому что журнала тогда нет вовсе. Вызывать из main до создания
+// трея: паника раньше этого уходит в никуда.
+func InitCrashOutput(debug bool) {
+	dir := DefaultConfigDir()
+	os.MkdirAll(dir, 0700)
+	path, limit := dir+`\crash.log`, int64(crashLogLimit)
+	if debug {
+		path, limit = dir+`\wgkeybot.log`, 0
+	}
+	if err := crashlog.Open(path, limit); err != nil {
+		log.Printf("[Crash] паники Go не будут записаны в %s: %v", path, err)
+	}
+}
+
+// InitProxyState называет прокси папку, где он держит то, что должно пережить
+// перезапуск приложения: адреса VK API на случай мёртвого DNS
+// (pkg/proxy/vk_host_memory.go) и отдых релеев (pkg/proxy/relay_rest_store.go).
+// Вызывать один раз при старте приложения — до первого Connect и до проверки
+// ссылки в режиме эксперта.
+func InitProxyState() {
+	dir := DefaultConfigDir()
+	os.MkdirAll(dir, 0700)
+	proxy.SetStateDir(dir)
+}
+
+// nulFreeWriter вырезает NUL из строк стандартного log: ошибки прокси, которые
+// пишут winbridge и tray, несут reason phrase релея VK вместе с его
+// завершающим нулём (то же делает logf в pkg/proxy).
+type nulFreeWriter struct{ w io.Writer }
+
+func (n nulFreeWriter) Write(p []byte) (int, error) {
+	if bytes.IndexByte(p, 0) < 0 {
+		return n.w.Write(p)
+	}
+	if _, err := n.w.Write(bytes.ReplaceAll(p, []byte{0}, nil)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // Manager управляет жизненным циклом одного WireGuard/TURN-тоннеля на Windows.
@@ -45,7 +95,7 @@ type Manager struct {
 	socks     *SocksServer
 	mode      Mode
 	socksPort int
-	physGW    string        // physical gateway at connect time, for detecting network changes
+	phys      physNet       // physical network at connect time, for detecting network changes
 	wgLUID    winipcfg.LUID // wintun adapter LUID (VPN mode), for route cleanup on disconnect
 	netWatch  *NetworkWatcher
 	connected bool
@@ -55,6 +105,14 @@ type Manager struct {
 	// подключения (SOCKS-режим на аплинке без next-hop, например PPPoE), флаг
 	// так и остаётся false — иначе watchdog на таком аплинке молчал бы всегда.
 	netLost atomic.Bool
+
+	// relaySwitchedAt — когда транспорт до релеев последний раз переключали
+	// (SetRelayTransport): в начале перезапуска и когда он поднялся или не
+	// поднялся. Сторож превращает это в Course.Rebuilt — старое рукопожатие не
+	// в счёт, новому транспорту даётся RebuiltGrace, — иначе он судил бы новый
+	// транспорт по рукопожатию старого и перезапустил бы или снёс его, пока
+	// тот поднимается (ревью Codex порта на Windows, 2026-10-23).
+	relaySwitchedAt atomic.Pointer[time.Time]
 }
 
 // NewManager создаёт Manager для заданного конфига в режиме VPN.
@@ -97,12 +155,64 @@ func IsTerminalConnectError(err error) bool {
 	return errors.As(err, &t)
 }
 
+// errVKUnreachable — старт прокси истёк без кредов, и VK не вернул ни байта ни
+// по одному соединению (proxy.ReadyStatusVKUnreachable): за шлюзом нет
+// интернета, не пройден captive portal или перед VK фильтр. Не терминальная:
+// сеть может вернуться, и реконнект watchdog'а пробует снова, — но пользователю
+// говорится, что дело в сети, а не в TURN или конфиге.
+var errVKUnreachable = errors.New(msgVKUnreachable)
+
+// IsVKUnreachable сообщает, что Connect не дошёл до VK по этой сети.
+func IsVKUnreachable(err error) bool { return errors.Is(err, errVKUnreachable) }
+
+// errRelaysCarryNothing — старт истёк с кредами и аллокациями, но ни один поток
+// не провёл через релей ни одного круга (proxy.ReadyStatusRelaysCarryNothing).
+// По UDP так выглядит сеть, где ответы на Allocate доходят, а данные через релей
+// — нет (мобильный Ростелеком за белым списком), и пользователю предлагается
+// TCP до релеев; по TCP — релеи отвечают, а сервер через них нет. Не
+// терминальная, как errVKUnreachable.
+var (
+	errRelaysCarryNothingUDP = errors.New(msgRelaysCarryNothingUDP)
+	errRelaysCarryNothingTCP = errors.New(msgRelaysCarryNothingTCP)
+)
+
+func relaysCarryNothing(overTCP bool) error {
+	if overTCP {
+		return errRelaysCarryNothingTCP
+	}
+	return errRelaysCarryNothingUDP
+}
+
+// IsRelaysCarryNothing сообщает, что релеи отвечали, а данные через них не шли.
+func IsRelaysCarryNothing(err error) bool {
+	return errors.Is(err, errRelaysCarryNothingUDP) || errors.Is(err, errRelaysCarryNothingTCP)
+}
+
 // HadGateway сообщает, был ли у подключения физический шлюз — при подключении
 // или появившийся после (см. CheckNetworkChange).
 func (m *Manager) HadGateway() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.physGW != ""
+	return m.phys.gw != ""
+}
+
+// physNet — физическая сеть подключения: дефолтный шлюз и интерфейс, через
+// который он доступен. Тот же шлюз за другим интерфейсом — тоже другая сеть:
+// Wi-Fi и Ethernet к одному роутеру видят один 192.168.1.1, а сокеты выходят с
+// разных адресов, и для релея это чужой 5-tuple. Принцип iOS network_switch.go
+// (интерфейс плюс адреса); смену адреса по DHCP на том же интерфейсе это не
+// ловит.
+type physNet struct{ gw, ifIndex string }
+
+func (n physNet) String() string { return n.gw + " (if " + n.ifIndex + ")" }
+
+// currentPhysNet читает физическую сеть из таблицы маршрутов; false — шлюза нет.
+func currentPhysNet() (physNet, bool) {
+	gw, ifIndex, err := DefaultGateway()
+	if err != nil || gw == "" {
+		return physNet{}, false
+	}
+	return physNet{gw: gw, ifIndex: ifIndex}, true
 }
 
 // ctx используется для отмены ожидания (captcha, timeout).
@@ -144,7 +254,7 @@ func (m *Manager) Connect(ctx context.Context) error {
 	//    В режиме SOCKS системная маршрутизация не трогается — RouteManager не нужен.
 	var routeMgr *RouteManager
 	if m.mode == ModeVPN {
-		rm, err := NewRouteManager()
+		rm, err := NewRouteManager(cfg.DNS)
 		if err != nil {
 			return fmt.Errorf("route manager: %w", err)
 		}
@@ -159,12 +269,8 @@ func (m *Manager) Connect(ctx context.Context) error {
 	//     режимах) и первый ответ на вопрос «есть ли сеть вообще»: без шлюза
 	//     воркеры прокси ждут у гейта (proxy.SetNetworkAvailable), а не жгут
 	//     креды и Allocate-квоту впустую. Дальше флаг ведёт CheckNetworkChange.
-	if gw, _, err := DefaultGateway(); err == nil {
-		m.physGW = gw
-	} else {
-		m.physGW = ""
-	}
-	proxy.SetNetworkAvailable(m.physGW != "")
+	m.phys, _ = currentPhysNet()
+	proxy.SetNetworkAvailable(m.phys.gw != "")
 
 	// 2. Определяем DNS — сначала пробуем системный, иначе встроенный.
 	sysDNS := GetSystemDNS()
@@ -233,6 +339,10 @@ func (m *Manager) Connect(ctx context.Context) error {
 			return terminal(errors.New(msgCallUnavailable))
 		case proxy.ReadyStatusTurnFatal:
 			return terminal(fmt.Errorf(msgTurnFatal, t.TurnFatalReason()))
+		case proxy.ReadyStatusVKUnreachable:
+			return errVKUnreachable
+		case proxy.ReadyStatusRelaysCarryNothing:
+			return relaysCarryNothing(t.RelaysOverTCP())
 		default:
 			return fmt.Errorf("TURN proxy failed (status %d)", status)
 		}
@@ -336,12 +446,17 @@ func (m *Manager) Connect(ctx context.Context) error {
 	return nil
 }
 
-// Тексты терминальных отказов TURN-прокси — одни и те же при подключении и
-// при перезапуске транспорта (tray.turnFatalMessage узнаёт их по маркерам).
+// Тексты отказов TURN-прокси — одни и те же при подключении и при перезапуске
+// транспорта (tray.turnFatalMessage узнаёт терминальные по маркерам).
+// msgVKUnreachable и msgRelaysCarryNothing* — не терминальные.
 const (
-	msgCallRequiresAuth = "VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Import token»"
+	msgCallRequiresAuth = "VK авторизация устарела (CALL_REQUIRES_AUTH) — обновите конфиг через «Импорт токена...»"
 	msgCallUnavailable  = "VK-звонок завершён/удалён или ссылка недействительна (CALL_UNAVAILABLE) — получите новую ссылку и обновите конфиг"
 	msgTurnFatal        = "TURN недоступен: %s — попробуйте позже или обновите конфиг"
+	msgVKUnreachable    = "VK не отвечает через эту сеть — подключиться не получится. Проверьте, есть ли интернет (вход в сеть Wi-Fi через браузер, оплата у провайдера), или попробуйте другую сеть"
+
+	msgRelaysCarryNothingUDP = "Релеи VK отвечают, но данные через них не доходят. Если это мобильная сеть или раздача с телефона (например, Ростелеком), выберите в меню «Транспорт до релеев» → TCP и подключитесь снова"
+	msgRelaysCarryNothingTCP = "Релеи VK отвечают, но сервер через них не отвечает — попробуйте позже или обновите конфиг"
 )
 
 // errNotConnected — перезапуск транспорта запрошен у отключённого туннеля.
@@ -412,6 +527,12 @@ func (m *Manager) awaitTransport(ctx context.Context, t *proxy.Tunnel) error {
 			return terminal(errors.New(msgCallUnavailable))
 		case proxy.ReadyStatusTurnFatal:
 			return terminal(fmt.Errorf(msgTurnFatal, t.TurnFatalReason()))
+		case proxy.ReadyStatusVKUnreachable:
+			// Под живым туннелем сеть может вернуться: следующий шаг watchdog'а
+			// решает, как для любого перезапуска, который не поднялся.
+			return errVKUnreachable
+		case proxy.ReadyStatusRelaysCarryNothing:
+			return relaysCarryNothing(t.RelaysOverTCP())
 		default:
 			return fmt.Errorf("TURN transport failed to start (status %d)", status)
 		}
@@ -471,7 +592,23 @@ type TunnelStats struct {
 	RxBytes       uint64
 	TxBytes       uint64
 	LastHandshake time.Time // нулевое, если рукопожатия ещё не было
+	// PathSilent — сколько ни один релей не отвечает по живой сети: темнота
+	// пути, которую нашли сами потоки (proxy.Tunnel.PathSilence); ноль, пока
+	// её нет.
+	PathSilent time.Duration
 }
+
+// RelaysSilentShown — сколько путь должен молчать, чтобы трей сказал «Релеи не
+// отвечают» (Android NETWORK_SILENT_SECONDS): короче — переключение сети,
+// полная очередь, — проходит под порогом.
+const RelaysSilentShown = 10 * time.Second
+
+// RelaysSilent сообщает, что трею пора сказать «Релеи не отвечают»: сеть есть,
+// но релеи по ней молчат дольше RelaysSilentShown. Не «туннель сломался» и не
+// «нет сети»: в тёмные полосы Android 18.10 сеть была подключена по две минуты,
+// а экран полминуты говорил «Подключено», потом «Переподключение…» — будто
+// виноват туннель, а не сеть, которая не доходила до релеев.
+func (st TunnelStats) RelaysSilent() bool { return st.PathSilent >= RelaysSilentShown }
 
 // Stats возвращает текущую статистику туннеля.
 func (m *Manager) Stats() TunnelStats {
@@ -484,9 +621,11 @@ func (m *Manager) Stats() TunnelStats {
 
 	uapi, err := m.tunnel.IpcGet()
 	if err != nil {
-		return TunnelStats{Connected: true}
+		return TunnelStats{Connected: true, PathSilent: m.tunnel.PathSilence()}
 	}
-	return parseWGStats(uapi)
+	st := parseWGStats(uapi)
+	st.PathSilent = m.tunnel.PathSilence()
+	return st
 }
 
 // IsConnected возвращает true если тоннель поднят.
@@ -533,13 +672,17 @@ func (m *Manager) SolveCaptcha(answer string) {
 	}
 }
 
-// CheckNetworkChange сверяет текущий физический дефолтный шлюз с записанным
-// и делает две вещи. Во-первых, сообщает прокси и watchdog'у, есть ли сеть
-// вообще: без шлюза воркеры ждут у гейта вместо того, чтобы жечь креды и
-// Allocate-квоту (proxy.SetNetworkAvailable, переходы логируются там), а
-// watchdog не объявляет туннель мёртвым (netLost). Во-вторых, если шлюз
-// сменился — уведомляет туннель: сброс DNS-кеша и доказательства пути, потоки
-// переподключаются по мере отвала. Возвращает true, если сеть сменилась.
+// CheckNetworkChange сверяет текущую физическую сеть (шлюз и его интерфейс,
+// physNet) с записанной и делает две вещи. Во-первых, сообщает прокси и
+// watchdog'у, есть ли сеть вообще: без шлюза воркеры ждут у гейта вместо того,
+// чтобы жечь креды и Allocate-квоту (proxy.SetNetworkAvailable, переходы
+// логируются там), а watchdog не объявляет туннель мёртвым (netLost).
+// Во-вторых, если сеть сменилась — уведомляет туннель: сброс DNS-кеша и
+// доказательства пути. Возвращает true, если сеть сменилась.
+//
+// И вернувшийся шлюз, и сменившийся будят потоки (Tunnel.Wake): каждый
+// спрашивает релей, жива ли аллокация, и за один RTT узнаёт, что после сна или
+// переезда сокет релею больше не знаком, — вместо 90 с детектора.
 //
 // Зовётся из опроса tray раз в 5 с и из NetworkWatcher по событию; оба пути
 // идемпотентны, повторный вызов без изменений ничего не делает.
@@ -547,45 +690,71 @@ func (m *Manager) CheckNetworkChange() bool {
 	m.mu.Lock()
 	t := m.tunnel
 	rm := m.routeMgr
-	prevGW := m.physGW
+	prev := m.phys
 	m.mu.Unlock()
 
 	if t == nil {
 		return false
 	}
 
-	gw, _, err := DefaultGateway()
-	online := err == nil && gw != ""
+	cur, online := currentPhysNet()
 	proxy.SetNetworkAvailable(online)
-	if lost := !online && prevGW != ""; m.netLost.Swap(lost) != lost {
+	back := false
+	if lost := !online && prev.gw != ""; m.netLost.Swap(lost) != lost {
 		if lost {
-			log.Printf("[Manager] Physical gateway %s lost — waiting for the network", prevGW)
+			log.Printf("[Manager] Physical gateway %s lost — waiting for the network", prev)
 		} else {
-			log.Printf("[Manager] Physical gateway is back: %s", gw)
+			log.Printf("[Manager] Physical gateway is back: %s", cur)
+			back = true
 		}
 	}
-	if !online || gw == prevGW {
+	if !online {
+		return false
+	}
+	if cur == prev {
+		if back {
+			// Та же сеть вернулась: Reassert вернёт маршруты, которые Windows
+			// мог снять вместе с интерфейсом (Refresh — если таблица успела
+			// смениться между опросами).
+			if rm != nil && !rm.Refresh() {
+				rm.Reassert()
+			}
+			t.Wake("gateway back")
+		}
 		return false
 	}
 
 	m.mu.Lock()
-	m.physGW = gw
+	m.phys = cur
 	m.mu.Unlock()
-	if prevGW == "" {
+	if prev.gw == "" {
 		// Шлюза при подключении не было (Connect без сети или SOCKS-режим
 		// на отвалившемся аплинке) — это не смена сети, а её появление;
 		// доказательство пути сбрасывать нечего.
-		log.Printf("[Manager] Gateway appeared: %s", gw)
+		log.Printf("[Manager] Gateway appeared: %s", cur)
 		return false
 	}
 
-	log.Printf("[Manager] Gateway changed: %s -> %s", prevGW, gw)
+	if cur.gw == prev.gw {
+		// Дефолтный маршрут перешёл на другой интерфейс к тому же роутеру
+		// (Wi-Fi ↔ Ethernet), без промежуточного «нет сети»: по одному адресу
+		// шлюза это было не отличить, и потоки ждали детектора 90 с.
+		log.Printf("[Manager] Interface changed under gateway %s: if %s -> if %s", cur.gw, prev.ifIndex, cur.ifIndex)
+	} else {
+		log.Printf("[Manager] Gateway changed: %s -> %s", prev, cur)
+	}
 	// Сначала маршруты: воркеры прокси начнут передозваниваться до релеев сразу
-	// после сигнала, и host-маршруты через старый шлюз увели бы их в туннель.
+	// после сигнала, и host-маршруты через старый шлюз или интерфейс увели бы их
+	// в туннель (Refresh сравнивает и шлюз, и LUID).
 	if rm != nil {
 		rm.Refresh()
 	}
 	t.OnNetworkChange()
+	// Сокеты потоков теперь выходят с другого адреса: по UDP для релея это чужой
+	// 5-tuple, и проверка аллокации получит 400 за один RTT; TCP-поток, прибитый
+	// к старому адресу, встанет, и его снимет сторож записей (stuckFor). Недавнее
+	// эхо со старой сети пробу не отменяет (wakeProbeDue).
+	t.Wake("network changed")
 	return true
 }
 
@@ -629,6 +798,10 @@ func (m *Manager) StartWatchdog(ctx context.Context, onDead func(), onFatal func
 		ticker := time.NewTicker(watchdog.PollInterval)
 		defer ticker.Stop()
 		w := watchdog.NewCourse(time.Now())
+		var seenSwitch time.Time
+		if at := m.relaySwitchedAt.Load(); at != nil {
+			seenSwitch = *at
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -651,6 +824,13 @@ func (m *Manager) StartWatchdog(ctx context.Context, onDead func(), onFatal func
 				return
 			}
 			now := time.Now()
+			// Транспорт до релеев переключили из трея: это перезапуск, только не
+			// сторожа, и в счёт перезапусков он не идёт.
+			if at := m.relaySwitchedAt.Load(); at != nil && *at != seenSwitch {
+				seenSwitch = *at
+				log.Printf("[Watchdog] The transport to the relays was switched — handshake gets %v", watchdog.RebuiltGrace)
+				w.Rebuilt(*at)
+			}
 			// Пока висит капча, TURN-прокси заблокирован в ожидании ответа
 			// пользователя, поэтому WG handshake закономерно устаревает. Это НЕ
 			// мёртвый туннель: reconnect здесь отменил бы ctx и снёс окно капчи
@@ -667,7 +847,12 @@ func (m *Manager) StartWatchdog(ctx context.Context, onDead func(), onFatal func
 				w.Offline(now)
 				continue
 			}
-			switch step := w.Poll(now, stats.LastHandshake, stats.TxBytes); step {
+			// Пока релеи молчат по живой сети, перезапуск транспорта и новые креды
+			// ничего не дадут: вердикт удерживается (watchdog.StepHold).
+			switch step := w.Poll(now, stats.LastHandshake, stats.TxBytes, stats.PathSilent > 0); step {
+			case watchdog.StepHold:
+				log.Printf("[Watchdog] WG handshake stale while no relay answers over the network (%v) — holding: no rebuild, no new credentials, for up to %v",
+					stats.PathSilent.Round(time.Second), watchdog.SilentHold)
 			case watchdog.StepResumed:
 				log.Printf("[Watchdog] Resumed from sleep — handshake gets %v to recover", watchdog.NeverAfter)
 			case watchdog.StepRecovered:

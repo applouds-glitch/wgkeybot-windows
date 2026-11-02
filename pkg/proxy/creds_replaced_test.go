@@ -108,7 +108,7 @@ func runWorkerAgainst(t *testing.T, ctx context.Context, group int, addr string,
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runWorker(ctx, WorkerGroupConfig{GroupID: group, Link: "test", UseUDP: true, PeerType: "wireguard", PeerAddr: peer}, s, 0)
+		runWorker(ctx, WorkerGroupConfig{GroupID: group, Link: "test", UseUDP: benchUseUDP(), PeerType: "wireguard", PeerAddr: peer}, s, 0)
 	}()
 	return done
 }

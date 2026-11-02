@@ -93,7 +93,9 @@ func TestNetworkLeftSince(t *testing.T) {
 
 // An Allocate that goes unanswered while the host reports the network gone is
 // not the relay's silence — and the same silence on a network that stayed still
-// counts, or the exemption would have swallowed the accounting whole.
+// counts, or the exemption would have swallowed the accounting whole. Another
+// relay is heard meanwhile in both: a silence nothing broke is held against no
+// relay whatever the network did (relay_silence.go).
 func TestSilentAllocateCountsOnlyWhileTheNetworkStayed(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -109,6 +111,18 @@ func TestSilentAllocateCountsOnlyWhileTheNetworkStayed(t *testing.T) {
 			resetServerHealth()
 			t.Cleanup(resetServerHealth)
 			addr := listenFakeRelay(t).LocalAddr().String() // reads nothing, answers nothing
+			heard := make(chan struct{})
+			defer close(heard)
+			go func() {
+				for {
+					select {
+					case <-heard:
+						return
+					case <-time.After(100 * time.Millisecond):
+						noteRelayHeard()
+					}
+				}
+			}()
 
 			if tc.leave {
 				go func() {
@@ -118,7 +132,7 @@ func TestSilentAllocateCountsOnlyWhileTheNetworkStayed(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*allocateSilenceTimeout)
 			defer cancel()
-			if _, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", addr, WorkerGroupConfig{UseUDP: true}); !errors.Is(err, errAllocateSilent) {
+			if _, _, _, _, _, err := dialAndAllocate(ctx, &stream{}, t.Name(), "pass", addr, WorkerGroupConfig{UseUDP: true}, dialOpts{}); !errors.Is(err, errAllocateSilent) {
 				t.Fatalf("want a silent Allocate, got %v", err)
 			}
 			if n := relayStrikes(addr); n != tc.wantStrike {

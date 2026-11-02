@@ -39,6 +39,12 @@ type AppSettings struct {
 	// LastConfigHash — SHA-256 последнего сохранённого конфига. Обновление,
 	// принёсшее тот же конфиг, ничего не пересохраняет и не переподключает.
 	LastConfigHash string `json:"last_config_hash,omitempty"`
+	// Expert — режим эксперта: свои MTU, DNS и ссылки VK поверх конфига бота
+	// (expert.go, pkg/expert).
+	Expert ExpertStored `json:"expert"`
+	// RelayTransport — транспорт до релеев (relay_transport.go): пусто — как в
+	// конфиге, "udp" или "tcp" — выбор в трее поверх конфига.
+	RelayTransport RelayTransport `json:"relay_transport,omitempty"`
 }
 
 // normalize проставляет дефолты для отсутствующих/некорректных полей.
@@ -48,6 +54,9 @@ func (s *AppSettings) normalize() {
 	}
 	if s.SocksPort < 1 || s.SocksPort > 65535 {
 		s.SocksPort = DefaultSocksPort
+	}
+	if !s.RelayTransport.valid() {
+		s.RelayTransport = RelayTransportAsConfigured
 	}
 }
 

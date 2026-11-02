@@ -8,8 +8,12 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -222,5 +226,128 @@ func TestResolveDoesNotCacheFailures(t *testing.T) {
 	}
 	if len(cache.inflight) != 0 {
 		t.Fatalf("inflight not cleaned up: %v", cache.inflight)
+	}
+}
+
+// Silence from every server is the machine's network; one server that
+// answered — even only to say SERVFAIL — makes the failure the name's. A
+// refused connection is no answer: a firewall on the way can send that just as
+// well.
+func TestResolveTellsSilenceFromAnswer(t *testing.T) {
+	cases := []struct {
+		name    string
+		answer  func(DNSServer) ([]string, error)
+		reached bool
+	}{
+		{"every query timed out", func(DNSServer) ([]string, error) { return nil, errors.New("i/o timeout") }, false},
+		{"the bypass route was refused for every server", func(DNSServer) ([]string, error) {
+			return nil, fmt.Errorf("DNS bypass route: %w", errors.New("add route: the network location cannot be reached"))
+		}, false},
+		{"one server said SERVFAIL", func(s DNSServer) ([]string, error) {
+			if s.IP == "8.8.8.8" {
+				return nil, dnsReachedf("DNS error: rcode=2")
+			}
+			return nil, errors.New("i/o timeout")
+		}, true},
+		{"one server answered with nothing", func(s DNSServer) ([]string, error) {
+			if s.IP == "8.8.8.8" {
+				return nil, nil
+			}
+			return nil, errors.New("i/o timeout")
+		}, true},
+		{"one server refused the connection", func(s DNSServer) ([]string, error) {
+			if s.IP == "8.8.8.8" {
+				return nil, fmt.Errorf("failed to connect to DoT server: %w", syscall.ECONNREFUSED)
+			}
+			return nil, errors.New("i/o timeout")
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeDNS(t, fakeServers("192.168.1.1", "8.8.8.8"),
+				func(_ context.Context, _ string, s DNSServer) ([]string, error) { return tc.answer(s) })
+			_, err := resolveWithOrderedServers(context.Background(), "internal.api.vk.ru")
+			reached, isLookup := dnsLookupOutcome(err)
+			if !isLookup {
+				t.Fatalf("not a lookup failure: %v", err)
+			}
+			if reached != tc.reached {
+				t.Fatalf("reached = %v, want %v (%v)", reached, tc.reached, err)
+			}
+			if !strings.Contains(err.Error(), "all DNS servers failed for internal.api.vk.ru") {
+				t.Fatalf("message changed: %v", err)
+			}
+		})
+	}
+}
+
+// Every way parseDNSResponse refuses a reply is a server reached.
+func TestParseDNSResponseFailuresReachedAServer(t *testing.T) {
+	nxdomain := make([]byte, 12)
+	nxdomain[2], nxdomain[3] = 0x81, 0x83 // response, recursion desired/available, rcode 3
+	empty := make([]byte, 12)
+	empty[2], empty[3] = 0x81, 0x80 // response, rcode 0, no answers
+	for name, reply := range map[string][]byte{
+		"too short":    {0x00, 0x01},
+		"not response": make([]byte, 12),
+		"NXDOMAIN":     nxdomain,
+		"no answers":   empty,
+	} {
+		if _, err := parseDNSResponse(reply, "vk.ru"); err == nil || !serverReached(err) {
+			t.Errorf("%s: %v is not marked as a server reached", name, err)
+		}
+	}
+}
+
+// A DoT or DoH connection that was accepted and then hung up before the TLS
+// handshake proved anything is no answer: a captive portal or a middlebox takes
+// connections to 443 and 853 just as readily. Played against a local listener
+// that accepts and closes.
+func TestEncryptedDNSAcceptedConnectionIsNoAnswer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	prevDoH, prevDoT := dohPort, dotPort
+	dohPort, dotPort = port, port
+	t.Cleanup(func() { dohPort, dotPort = prevDoH, prevDoT })
+
+	if _, err := resolveDoTWithServer(context.Background(), "vk.ru", "127.0.0.1", "dns.example"); err == nil || serverReached(err) {
+		t.Errorf("DoT: %v read as an answer", err)
+	}
+	if _, err := resolveDoHWithServer(context.Background(), "vk.ru", "127.0.0.1", "dns.example"); err == nil || serverReached(err) {
+		t.Errorf("DoH: %v read as an answer", err)
+	}
+}
+
+// A cancelled lookup must come out as the cancellation, never as a network that
+// answered nothing: the live follower of a shared lookup takes it over only on a
+// context error. Here the select nearly always wakes on the cancellation; the
+// guard after the loop covers the rarer order — the last result winning the
+// select after the context was cancelled — which a host test cannot force, so
+// this only keeps the common order honest.
+func TestResolveCancellationIsNeverSilence(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		withFakeDNS(t, fakeServers("192.168.1.1"),
+			func(context.Context, string, DNSServer) ([]string, error) {
+				cancel()
+				return nil, errors.New("use of closed network connection")
+			})
+		_, err := resolveWithOrderedServers(ctx, "internal.api.vk.ru")
+		if _, isLookup := dnsLookupOutcome(err); isLookup || !errors.Is(err, context.Canceled) {
+			t.Fatalf("round %d: cancelled lookup came out as %v", i, err)
+		}
 	}
 }

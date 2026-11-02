@@ -75,7 +75,7 @@ func TestBlackholedAllocationUnderSRTPEndsTheSessionAtOnce(t *testing.T) {
 	s, _ := newNoDTLSTestStream(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, raw, relayConn, rtt, perm, err := dialAndAllocate(ctx, s, t.Name(), "pass", addr, cfg)
+	client, raw, relayConn, rtt, perm, err := dialAndAllocate(ctx, s, t.Name(), "pass", addr, cfg, dialOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

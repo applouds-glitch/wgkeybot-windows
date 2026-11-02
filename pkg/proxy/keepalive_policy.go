@@ -44,6 +44,15 @@ const (
 	// quiet kept receiving every Nth chunk for the whole 90s until the detector
 	// fired, which for TCP inside the tunnel is a steady 1/N loss for a minute
 	// and a half.
+	//
+	// This is the idle stream's measure — the echo is all it hears — and under
+	// load the wait is shorter: a stream silent for silentUnderLoadAfter while
+	// two siblings hear their relays and have each received three chunks since
+	// is skipped at once (silent_under_load.go). In the Android field log of
+	// 2026-10-20/21 (a cellular network over UDP, nine streams) a relay went
+	// deaf under its streams 26 times in nineteen minutes, each paid at the 35 s
+	// here: 939 stream-seconds of a ninth of the downlink sent into a void,
+	// which TCP inside the tunnel read as ~11% loss nearly all the time.
 	dispatchStaleAfter = 35 * time.Second
 
 	// A failed write retries quickly on that stream. A successful retry rejoins
@@ -58,6 +67,26 @@ const (
 	// credential, tripping the TURN 486 quota → captcha.
 	freezeSlack = 20 * time.Second
 )
+
+// keepaliveEchoRetry: a ready stream sends its keepalive once more this long
+// after one that nothing answered — no echo, no data.
+//
+// Android field log of 2026-10-18/20 (a tablet on home Wi-Fi): 75 times in ~30 h
+// a single stream fell silent for 50 s — two keepalive intervals to the second
+// — and came back by itself on the next echo; 49 of them on the relay that lost
+// 3-13% of its downlink, 26 on the one that lost nothing. One keepalive or its
+// echo had been lost, and the next chance to be heard was the grid, 25 s later;
+// from the 35th second the dispatcher benched the stream and the server's skip
+// list (WGH1) followed. Sent again a few seconds later, a lost one costs the
+// stream 3 s of silence instead of 25, and at under 35 it is never benched. One
+// packet of 20 bytes.
+//
+// Once per keepalive: a second miss is the path, not the packet, and the grid
+// comes round 22 s later anyway. Not for the keepalive sent at a thaw, which
+// the post-wake probe follows with pings of its own (wake_probe.go).
+//
+// A var for the host tests, which cannot wait 3 s.
+var keepaliveEchoRetry = 3 * time.Second
 
 // wireGuardKeepaliveSender couples WireGuard's encrypted keepalive to the
 // existing TURN keepalive grid. TURN still sends one STUN liveness probe per
@@ -147,21 +176,105 @@ type streamActivity struct {
 	// lastHeard is lastRx without the freeze reset: the last packet that really
 	// arrived, or the session's start if none has. It is for the health
 	// accounting — how long the relay was silent — which the detector's clock
-	// cannot answer once resetLiveness has moved it.
+	// cannot answer once resetLiveness has moved it — and for the dispatcher,
+	// which trusts a stream on a real echo, not on a reset (dispatchStale).
 	lastHeard atomic.Int64
+
+	// lastPong is the highest seq the server has echoed back on this session
+	// (stunProbeSeq): the post-wake probe's mark. It only moves forward — a late
+	// or repeated echo never takes back what a newer one has shown — and starts
+	// from zero with every session, as the probe's seq does (wake_probe.go).
+	// probeSent is the highest seq the probe has written: an echo naming a seq
+	// beyond it is not ours and moves nothing.
+	lastPong  atomic.Uint64
+	probeSent atomic.Uint64
+
+	// start is when the session began: a stream on another relay vouches for
+	// the path through a deaf session's silence only if it was there before
+	// that silence began (relay_deaf.go).
+	start time.Time
+
+	// rxCount is how many packets have really been heard this session, for the
+	// judge of silence under load (silent_under_load.go), which weighs what a
+	// stream's siblings received while it heard nothing.
+	rxCount atomic.Uint64
+	// silentUnderLoad is the lastHeard that judge's verdict was given for: the
+	// stream is stale (stale) for as long as lastHeard stays there, and the
+	// next packet lifts the verdict without a turn of the judge. Zero: none.
+	silentUnderLoad atomic.Int64
 }
 
 func newStreamActivity(now time.Time, phase time.Duration) *streamActivity {
-	a := &streamActivity{phase: phase}
+	a := &streamActivity{phase: phase, start: now}
 	a.lastRx.Store(now.UnixNano())
 	a.lastHeard.Store(now.UnixNano())
 	return a
 }
 
+// noteRx stores lastHeard ahead of lastRx, so that frozeSinceHeard, reading
+// them the other way round, never takes a packet arriving as a freeze.
 func (a *streamActivity) noteRx(now time.Time) {
-	a.lastRx.Store(now.UnixNano())
 	a.lastHeard.Store(now.UnixNano())
+	a.lastRx.Store(now.UnixNano())
+	a.rxCount.Add(1)
+	// The judge of silence under load, if idle, turns on this packet
+	// (silent_under_load.go); never waited for.
+	wakeSilentUnderLoadJudge()
 }
+
+// heardCount is how many packets this session has really heard.
+func (a *streamActivity) heardCount() uint64 { return a.rxCount.Load() }
+
+// markSilentUnderLoad records the verdict of silence under load for the
+// silence that began at heard (a lastHeard value).
+func (a *streamActivity) markSilentUnderLoad(heard int64) { a.silentUnderLoad.Store(heard) }
+
+// foundSilentUnderLoad reports whether that verdict stands: given for the
+// present silence, and nothing heard since.
+func (a *streamActivity) foundSilentUnderLoad() bool {
+	return a.silentUnderLoad.Load() == a.lastHeard.Load()
+}
+
+// stale is the dispatcher's measure (dispatchStale): the relay silent for
+// longer than dispatchStaleAfter, or the stream found silent under load and
+// not heard since (silent_under_load.go). One read of lastHeard serves both,
+// so a packet arriving between them cannot leave a lifted verdict in force.
+func (a *streamActivity) stale(now time.Time) bool {
+	heard := a.lastHeard.Load()
+	return now.Sub(time.Unix(0, heard)) > dispatchStaleAfter || a.silentUnderLoad.Load() == heard
+}
+
+// frozeSinceHeard reports whether the liveness clock has been reset for a
+// freeze (resetLiveness) since the relay was last really heard: the silence
+// heardAge measures has a freeze in it — on Windows, a sleep.
+func (a *streamActivity) frozeSinceHeard() bool {
+	rx := a.lastRx.Load()
+	return rx > a.lastHeard.Load()
+}
+
+// notePong records an echoed probe seq; forward only, and never beyond what
+// the probe has sent.
+func (a *streamActivity) notePong(seq uint64) {
+	if seq > a.probeSent.Load() {
+		return
+	}
+	for {
+		old := a.lastPong.Load()
+		if seq <= old || a.lastPong.CompareAndSwap(old, seq) {
+			return
+		}
+	}
+}
+
+// noteProbeEcho is the RX path's call for an echoed STUN keepalive: only one
+// of our probe's shape names a seq (isStunProbeEcho).
+func (a *streamActivity) noteProbeEcho(b []byte) {
+	if isStunProbeEcho(b) {
+		a.notePong(stunProbeSeq(b))
+	}
+}
+
+func (a *streamActivity) pongMark() uint64 { return a.lastPong.Load() }
 
 // heardAge is how long ago the relay was last really heard — since the session
 // began, if it never was.
@@ -179,6 +292,13 @@ func (a *streamActivity) heardAge(now time.Time) time.Duration {
 // so tearing the stream down on it would punish a healthy path.
 func (a *streamActivity) resetLiveness(now time.Time) {
 	a.lastRx.Store(now.UnixNano())
+}
+
+// echoMissed reports whether nothing has arrived since a keepalive went out at
+// sentAt: not its echo, not data. Either answers it; a successful write
+// answers nothing (noteRx), nor does a freeze reset (resetLiveness).
+func (a *streamActivity) echoMissed(sentAt time.Time) bool {
+	return atomicTimestamp(&a.lastHeard).Before(sentAt)
 }
 
 func atomicTimestamp(v *atomic.Int64) time.Time {
@@ -204,14 +324,22 @@ const (
 	keepaliveGridWake keepaliveWakeReason = iota
 	keepaliveRetryWake
 	keepaliveDeadCheckWake
+	keepaliveEchoRetryWake
 )
 
-func (a *streamActivity) nextDeadline(now, retryAt time.Time) (time.Time, keepaliveWakeReason) {
+// nextDeadline is when the keepalive loop wakes next and why: the grid, a
+// retry of a failed write (retryAt), the repeat of a keepalive nothing has
+// answered (echoAt, keepaliveEchoRetry) or the dead-stream check.
+func (a *streamActivity) nextDeadline(now, retryAt, echoAt time.Time) (time.Time, keepaliveWakeReason) {
 	next := nextKeepaliveGrid(now, a.phase)
 	reason := keepaliveGridWake
 	if !retryAt.IsZero() && retryAt.Before(next) {
 		next = retryAt
 		reason = keepaliveRetryWake
+	}
+	if !echoAt.IsZero() && echoAt.Before(next) {
+		next = echoAt
+		reason = keepaliveEchoRetryWake
 	}
 	// Liveness checks must not be postponed by the normal probe cadence. This
 	// keeps the advertised 90s dead-stream threshold exact even though normal
@@ -244,5 +372,28 @@ func waitUntil(ctx context.Context, deadline time.Time) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+// keepaliveWait is the keepalive loop's wait: waitUntilOrWake, a var for the
+// host tests to hold a wake up past the grid point it was due before.
+var keepaliveWait = waitUntilOrWake
+
+// waitUntilOrWake is waitUntil that also returns, with woke = true, when a
+// host wake is broadcast (hostWakeChannel). ok = false means ctx is done.
+func waitUntilOrWake(ctx context.Context, deadline time.Time, wake <-chan struct{}) (woke, ok bool) {
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return false, ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, false
+	case <-timer.C:
+		return false, true
+	case <-wake:
+		return true, true
 	}
 }

@@ -21,3 +21,26 @@ var localNetworkErrnos = []syscall.Errno{
 	1231,  // ERROR_NETWORK_UNREACHABLE
 	1236,  // ERROR_CONNECTION_ABORTED
 }
+
+// The relay's answers a socket reports, and the silences it times out on
+// (relay_silence.go). Winsock's own numbers: syscall's ECONNREFUSED and the
+// like are invented on Windows and never come back from a socket.
+var (
+	relayRefusedErrnos  = []syscall.Errno{10061, 1225} // WSAECONNREFUSED, ERROR_CONNECTION_REFUSED
+	relayResetErrnos    = []syscall.Errno{10054, 109}  // WSAECONNRESET, ERROR_BROKEN_PIPE
+	relayTimedOutErrnos = []syscall.Errno{10060, 1460} // WSAETIMEDOUT, ERROR_TIMEOUT
+)
+
+// relayFlowGaveUpErrnos are how Windows reports a TCP connection to a relay it
+// gave up itself (relayFlowConn): the retransmission limit run out
+// (relayTCPUserTimeout) or the keepalive probes unanswered. Winsock does not
+// say which of these a given limit ends in — a timeout, an abort "possibly due
+// to a data transmission time-out" or a keepalive reset — so all of them count;
+// the errno is in the line the session ends with.
+var relayFlowGaveUpErrnos = []syscall.Errno{
+	10060, // WSAETIMEDOUT
+	1460,  // ERROR_TIMEOUT
+	10053, // WSAECONNABORTED
+	1236,  // ERROR_CONNECTION_ABORTED
+	10052, // WSAENETRESET: the keepalive found the connection broken
+}

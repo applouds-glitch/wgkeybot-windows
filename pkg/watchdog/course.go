@@ -17,6 +17,9 @@ const (
 	StepRebuild
 	// StepRebuildNewCreds — перезапустить его на новых кредах (один поход в VK).
 	StepRebuildNewCreds
+	// StepHold — вердикт пришёл, пока ни один релей не отвечает по живой сети:
+	// ждать, ничего не перезапуская.
+	StepHold
 	// StepTearDown — сдаться: гасить туннель и переподключаться целиком.
 	StepTearDown
 )
@@ -30,6 +33,10 @@ const (
 	// Rebuilds — сколько раз транспорт перезапускается, прежде чем туннель
 	// гасят; все, кроме первого, — на новых кредах.
 	Rebuilds = 2
+	// SilentHold — сколько держится вердикт при молчащих релеях, прежде чем
+	// туннель гасят: те два шага перезапуска, вместо которых он стоит, по
+	// ~2,5 мин каждый.
+	SilentHold = 5 * time.Minute
 )
 
 // Course — курс фонового watchdog'а по одной сессии туннеля: что делать с
@@ -45,10 +52,28 @@ const (
 // После перезапуска старый handshake не считается: у нового транспорта есть
 // RebuiltGrace на свой, от момента перезапуска. Handshake после перезапуска —
 // значит, сработало, и следующий отказ начинает курс заново.
+//
+// Ни один перезапуск не делается, пока прокси говорит, что по живой сети не
+// отвечает ни один релей (pathSilent — найденная темнота пути,
+// pkg/proxy/dark_scout.go): вердикт тогда — StepHold (Android 8133eb44). В
+// тёмные полосы Android 18.10 сеть по две-семь минут ничего не везла;
+// перезапуск в такой полосе перезапускал прокси, который забывал темноту и
+// снова посылал в неё всех воркеров, а второй сбрасывал креды ради похода в VK,
+// который не мог пройти, — и, когда сеть возвращалась, стоил добычи, которую
+// кеш сберёг бы, с шансом капчи. Темноту тем временем дозванивают разведчики,
+// и первый же ответивший релей её заканчивает. Туннель всё равно гаснет —
+// через SilentHold после удержанного вердикта, проверяемого на каждом опросе,
+// пока релеи молчат, а не на следующем вердикте: тому нужен растущий TX, а
+// WireGuard, бросив initiation, ничего не шлёт. Удержание заканчивают только
+// handshake после его начала или пропавшая сеть. Вердикт, когда релеи снова
+// отвечают, берёт тот шаг, что был следующим.
 type Course struct {
 	h        *Handshake
 	since    time.Time // handshake старше этого момента не считается
 	rebuilds int
+	// heldSince — когда вердикт при молчащих релеях был удержан; ноль, пока
+	// удержания нет.
+	heldSince time.Time
 }
 
 // NewCourse начинает курс по туннелю, поднятому к моменту now.
@@ -60,15 +85,21 @@ func NewCourse(now time.Time) *Course {
 func (c *Course) Hold(now time.Time) { c.h.Hold(now) }
 
 // Offline — см. Handshake.Offline; без сети перезапускать нечего, счёт
-// перезапусков сохраняется.
-func (c *Course) Offline(now time.Time) { c.h.Offline(now) }
+// перезапусков сохраняется. Удержание при молчащих релеях кончается: сеть,
+// которая вернётся, получит его целиком, а не остаток старого.
+func (c *Course) Offline(now time.Time) {
+	c.h.Offline(now)
+	c.heldSince = time.Time{}
+}
 
 // Rebuilds — сколько перезапусков сделано с последнего handshake; 0, пока
 // сессия здорова.
 func (c *Course) Rebuilds() int { return c.rebuilds }
 
-// Poll оценивает очередной опрос (аргументы — как у Handshake.Poll).
-func (c *Course) Poll(now, lastHandshake time.Time, tx uint64) Step {
+// Poll оценивает очередной опрос (первые три аргумента — как у
+// Handshake.Poll); pathSilent — прокси туннеля не слышит ни одного релея по
+// живой сети (см. Course).
+func (c *Course) Poll(now, lastHandshake time.Time, tx uint64, pathSilent bool) Step {
 	hs := lastHandshake
 	if hs.Before(c.since) {
 		hs = time.Time{}
@@ -77,10 +108,29 @@ func (c *Course) Poll(now, lastHandshake time.Time, tx uint64) Step {
 	if recovered {
 		c.rebuilds = 0
 	}
-	switch c.h.Poll(now, hs, tx) {
-	case Resumed:
+	if !c.heldSince.IsZero() && !lastHandshake.Before(c.heldSince) {
+		c.heldSince = time.Time{} // handshake после начала удержания
+	}
+	ev := c.h.Poll(now, hs, tx)
+	if ev == Resumed {
+		c.heldSince = time.Time{}
 		return StepResumed
+	}
+	if !c.heldSince.IsZero() && pathSilent {
+		c.h.deadChecks = 0
+		if now.Sub(c.heldSince) >= SilentHold {
+			return StepTearDown
+		}
+		return StepNone
+	}
+	switch ev {
 	case Dead:
+		if pathSilent {
+			c.heldSince = now
+			c.h.deadChecks = 0
+			return StepHold
+		}
+		c.heldSince = time.Time{}
 		switch {
 		case c.rebuilds >= Rebuilds:
 			return StepTearDown

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wgkeybot/windows/pkg/connlink"
 	"github.com/wgkeybot/windows/pkg/proxy"
 )
 
@@ -184,7 +185,7 @@ func parseTURNSettings(lines []string, t *proxy.Config) {
 			t.PeerType = v
 		case "streamspercred":
 			if n, err := strconv.Atoi(v); err == nil {
-				t.StreamsPerCred = clamp(n, 1, 16)
+				t.StreamsPerCred = clamp(n, 1, proxy.MaxStreamsPerCredential)
 			}
 		case "watchdogtimeout":
 			if n, err := strconv.Atoi(v); err == nil && n >= 5 {
@@ -192,6 +193,8 @@ func parseTURNSettings(lines []string, t *proxy.Config) {
 			}
 		case "wrapkey":
 			t.WrapKey = v
+		case "extrarelays":
+			t.ExtraRelays = v
 		}
 	}
 }
@@ -226,7 +229,7 @@ func (c *TunnelConfig) BuildWGUAPIConfig(listenAddr string) string {
 	return sb.String()
 }
 
-const apiBaseURL = "https://key.shadowgate.online"
+const apiBaseURL = "https://" + connlink.ServiceHost
 
 // AppVersion отправляется в заголовке X-App-Version каждого запроса к API.
 // Устанавливается пакетом tray при старте.
@@ -235,6 +238,16 @@ var AppVersion = "dev"
 // ErrUnauthorized возвращается когда сервер отвечает 401.
 // Пользователю нужно заново выполнить импорт токена.
 var ErrUnauthorized = errors.New("сессия устарела, выполните «Импорт токена...» заново")
+
+// statusError — сервер ответил, и ответ не 2xx.
+type statusError struct {
+	code int
+	body string
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("сервер вернул %d: %s", e.code, e.body)
+}
 
 // UpgradeRequiredError возвращается когда сервер отвечает 426.
 type UpgradeRequiredError struct {
@@ -319,7 +332,7 @@ func apiGet(urlStr, accessToken string) ([]byte, error) {
 			return nil, &UpgradeRequiredError{DownloadURL: j.DownloadURL}
 		default:
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return nil, fmt.Errorf("сервер вернул %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+				return nil, &statusError{code: resp.StatusCode, body: strings.TrimSpace(string(body))}
 			}
 			return body, nil
 		}
@@ -330,9 +343,9 @@ func apiGet(urlStr, accessToken string) ([]byte, error) {
 // InitFromToken выполняет первичный импорт по одноразовому токену.
 // Возвращает конфиг и access_token для последующих вызовов FetchConfig.
 func InitFromToken(token string) (config []byte, accessToken string, err error) {
-	body, err := apiGet(apiBaseURL+"/api/v1/init/"+strings.TrimSpace(token), "")
+	body, err := apiGet(apiBaseURL+"/api/v1/init/"+token, "")
 	if err != nil {
-		return nil, "", err
+		return nil, "", initError(err)
 	}
 	var result struct {
 		AccessToken string `json:"access_token"`

@@ -33,6 +33,16 @@ const (
 	// столько раз подряд, что дальше пробовать бессмысленно, либо звонок умер
 	// уже после старта. Terminal: watchdog не должен переподключаться.
 	ReadyStatusTurnFatal ReadyStatus = 4
+	// ReadyStatusVKUnreachable — старт истёк без кредов, и ни одно соединение с
+	// VK не вернуло ни байта (start_outcome.go): за шлюзом нет интернета,
+	// captive portal не пройден или перед VK фильтр. Не терминальный — сеть может
+	// вернуться, — но и не «TURN не поднялся»: до релеев дело не дошло.
+	ReadyStatusVKUnreachable ReadyStatus = 5
+	// ReadyStatusRelaysCarryNothing — старт истёк с кредами и аллокациями, но ни
+	// один поток не провёл через релей ни одного круга (start_outcome.go). По UDP
+	// так выглядит сеть, где поможет TCP до релеев; так же — и сервер, который не
+	// отвечает. Не терминальный.
+	ReadyStatusRelaysCarryNothing ReadyStatus = 6
 )
 
 // Config — параметры TURN-прокси + WireGuard для Windows-клиента.
@@ -53,6 +63,10 @@ type Config struct {
 	TurnIP   string `json:"turn_ip"`
 	TurnPort int    `json:"turn_port"`
 	PeerType string `json:"peer_type"`
+
+	// Релеи сверх выданных VK для ссылки (#@wgt:ExtraRelays, relay_extra.go):
+	// IP с необязательным портом через запятую.
+	ExtraRelays string `json:"extra_relays,omitempty"`
 
 	// Обфускация WRAP
 	WrapKey string `json:"wrap_key,omitempty"`
@@ -121,6 +135,7 @@ func NewTunnel(cfg Config) (*Tunnel, error) {
 	if cfg.StreamsPerCred == 0 {
 		cfg.StreamsPerCred = 4
 	}
+	cfg.StreamsPerCred = clampStreamsPerCred(cfg.StreamsPerCred)
 	if cfg.WatchdogSecs == 0 {
 		cfg.WatchdogSecs = 30
 	}
@@ -180,21 +195,25 @@ func (t *Tunnel) startGeneration(keepDNS bool) *bootState {
 	if listenAddr == "" {
 		listenAddr = t.cfg.ListenAddr
 	}
+	// The generation's own copy: the transport may change under lifeMu
+	// (SetRelayOverTCP) while this one starts.
+	cfg := t.cfg
 
 	go func() {
 		b.result = StartProxy(StartProxyParams{
-			PeerAddr:        t.cfg.PeerAddr,
-			VKLink:          t.cfg.VKLink,
-			StreamNum:       t.cfg.StreamsTotal,
-			UseUDP:          t.cfg.UseUDP,
+			PeerAddr:        cfg.PeerAddr,
+			VKLink:          cfg.VKLink,
+			StreamNum:       cfg.StreamsTotal,
+			UseUDP:          cfg.UseUDP,
 			ListenAddr:      listenAddr,
-			TurnIP:          t.cfg.TurnIP,
-			TurnPort:        t.cfg.TurnPort,
-			PeerType:        t.cfg.PeerType,
-			StreamsPerCred:  t.cfg.StreamsPerCred,
-			WatchdogTimeout: t.cfg.WatchdogSecs,
-			WrapKey:         t.cfg.WrapKey,
-			SystemDNS:       t.cfg.SystemDNS,
+			TurnIP:          cfg.TurnIP,
+			TurnPort:        cfg.TurnPort,
+			ExtraRelays:     cfg.ExtraRelays,
+			PeerType:        cfg.PeerType,
+			StreamsPerCred:  cfg.StreamsPerCred,
+			WatchdogTimeout: cfg.WatchdogSecs,
+			WrapKey:         cfg.WrapKey,
+			SystemDNS:       cfg.SystemDNS,
 			Parent:          ctx,
 			OnListen:        t.publishListenAddr,
 			KeepDNSCache:    keepDNS,
@@ -221,6 +240,41 @@ func (t *Tunnel) publishListenAddr(addr string) {
 func (t *Tunnel) RestartTransport(dropCredentials bool) error {
 	t.lifeMu.Lock()
 	defer t.lifeMu.Unlock()
+	return t.restartTransportLocked(dropCredentials)
+}
+
+// SetRelayOverTCP переключает транспорт до релеев (relay_transport.go) и, если
+// он поменялся, перезапускает TURN-транспорт под живым WireGuard, как
+// RestartTransport, с теми же кредами: у прокси один транспорт на поколение,
+// и записи пути — услышанные релеи, темнота — начинаются заново с новым.
+// changed — был ли перезапуск; дальше — WaitStartedContext.
+func (t *Tunnel) SetRelayOverTCP(overTCP bool) (changed bool, err error) {
+	t.lifeMu.Lock()
+	defer t.lifeMu.Unlock()
+	if t.stopped {
+		return false, errors.New("tunnel is stopped")
+	}
+	if t.cfg.UseUDP != overTCP {
+		return false, nil
+	}
+	t.cfg.UseUDP = !overTCP
+	if overTCP {
+		turnLog("[PROXY] Relay transport is now TCP — restarting the TURN transport under the live WireGuard")
+	} else {
+		turnLog("[PROXY] Relay transport is now UDP — restarting the TURN transport under the live WireGuard")
+	}
+	return true, t.restartTransportLocked(false)
+}
+
+// RelaysOverTCP — ходит ли прокси до релеев по TCP (SetRelayOverTCP).
+func (t *Tunnel) RelaysOverTCP() bool {
+	t.lifeMu.Lock()
+	defer t.lifeMu.Unlock()
+	return !t.cfg.UseUDP
+}
+
+// restartTransportLocked — RestartTransport под lifeMu.
+func (t *Tunnel) restartTransportLocked(dropCredentials bool) error {
 	if t.stopped {
 		return errors.New("tunnel is stopped")
 	}
@@ -258,16 +312,33 @@ func (t *Tunnel) WaitReadyContext(ctx context.Context, timeout time.Duration) Re
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case <-b.ready:
-		// StartProxy returned — check outcome below.
-	case <-CaptchaNotifyChan():
-		// RequestCaptcha was called while prefetch was still running.
-		return ReadyStatusCaptchaRequired
-	case <-timer.C:
-		return ReadyStatusError
-	case <-ctx.Done():
-		return ReadyStatusError
+wait:
+	for {
+		select {
+		case <-b.ready:
+			// StartProxy returned — check outcome below.
+			break wait
+		case <-CaptchaNotifyChan():
+			// RequestCaptcha was called while prefetch was still running — or
+			// long before, with nobody waiting here: the channel keeps one
+			// notification, and a captcha asked for mid-session (solved by the
+			// tray's poll, tray.watchStatus) left one behind. The next Connect
+			// took it for a captcha of its own and opened the captcha window on
+			// an empty URL. Only a captcha still pending is one.
+			if PendingCaptchaURL() != "" {
+				return ReadyStatusCaptchaRequired
+			}
+		case <-timer.C:
+			// StartProxy ещё идёт — например, кредов всё ещё ждёт prefetch, — а
+			// ни одного креда и ни байта от VK: то же «VK не отвечает», что дал
+			// бы его собственный таймаут (start_outcome.go).
+			if vkUnreachableSoFar() {
+				return ReadyStatusVKUnreachable
+			}
+			return ReadyStatusError
+		case <-ctx.Done():
+			return ReadyStatusError
+		}
 	}
 	if reason := turnFatalReason(); reason != "" {
 		return ReadyStatusTurnFatal
@@ -315,6 +386,10 @@ func (b *bootState) status() ReadyStatus {
 		return ReadyStatusAuthRequired
 	case -4:
 		return ReadyStatusCallUnavailable
+	case startVKUnreachable:
+		return ReadyStatusVKUnreachable
+	case startRelaysCarryNothing:
+		return ReadyStatusRelaysCarryNothing
 	default:
 		return ReadyStatusError
 	}
@@ -482,12 +557,37 @@ func (t *Tunnel) PendingCaptchaURL() string { return PendingCaptchaURL() }
 // в цикле WaitReady на подключении и в тике watchdog'а уже после него.
 func (t *Tunnel) TurnFatalReason() string { return turnFatalReason() }
 
+// PathSilence — сколько путь до релеев молчит, когда потоки это знают:
+// найденная темнота пути (dark_scout.go); ноль, пока её нет — простой туннель,
+// который какое-то время ничего не слышит, не молчит. Ноль и без работающего
+// прокси (как -1 у Android): темнота, найденная остановленным или отменённым
+// поколением, держала бы сторожа в HOLD, хотя дозваниваться в неё уже некому.
+func (t *Tunnel) PathSilence() time.Duration {
+	set := activeStreams.Load()
+	if set == nil {
+		return 0
+	}
+	return pathSilence(*set, activeOverTCP.Load(), time.Now())
+}
+
 // SolveCaptcha — передаёт ответ captcha ожидающей Go-горутине.
 func (t *Tunnel) SolveCaptcha(answer string) { PublishCaptchaAnswer(answer) }
 
 // OnNetworkChange сбрасывает DNS-кеш и пересоздаёт HTTP-соединения.
 // Вызывается когда Windows обнаруживает смену физической сети.
 func (t *Tunnel) OnNetworkChange() { NotifyNetworkChange() }
+
+// Wake сообщает потокам, что сеть у хоста снова есть: каждый спрашивает релей,
+// жива ли его аллокация (alloc_check.go), и слушает эхо пробы (wake_probe.go) —
+// если не слышал релей последние секунды и не пробовался только что. Сон
+// ноутбука цикл keepalive видит сам, но Wi-Fi в этот момент часто ещё не
+// поднят, и проба уходит в никуда; winbridge зовёт Wake, когда физический шлюз
+// вернулся или сменился — тогда ответ получить можно. Поток, родившийся после
+// вызова, его не обслуживает (newWakeWatch).
+func (t *Tunnel) Wake(why string) {
+	turnLog("[PROXY] host wake (%s) — the streams ask their relays", why)
+	broadcastHostWake()
+}
 
 // IpcGet возвращает текущую статистику WireGuard в UAPI-формате.
 func (t *Tunnel) IpcGet() (string, error) {

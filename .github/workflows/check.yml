@@ -49,4 +49,34 @@ jobs:
         env:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: go test -timeout 3m ./tray ./assets ./pkg/...
+        shell: pwsh
+        run: |
+          go test -json -timeout 8m ./tray ./assets ./pkg/... > test-results.jsonl
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            $failures = Get-Content test-results.jsonl |
+              Where-Object { $_ -match '"Action":"fail"' } |
+              ForEach-Object { $_ | ConvertFrom-Json } |
+              Where-Object { $_.Test } |
+              Select-Object -ExpandProperty Test -Unique
+            foreach ($test in $failures) {
+              Write-Output "::error title=Windows test failed::$test"
+            }
+            $failedTests = @{}
+            foreach ($test in $failures) { $failedTests[$test] = $true }
+            Get-Content test-results.jsonl |
+              Where-Object { $_ -match '_test\.go:[0-9]+:' } |
+              ForEach-Object { $_ | ConvertFrom-Json } |
+              Where-Object { $_.Test -and $failedTests.ContainsKey($_.Test) } |
+              ForEach-Object { $_.Output.Trim() } |
+              Select-Object -Unique -First 20 |
+              ForEach-Object { Write-Output "::error title=Test assertion::$_" }
+            if (-not $failures) {
+              Write-Output "::error title=Go test failed::See test step log"
+            }
+            exit $testExit
+          }
+          Get-Content test-results.jsonl |
+            Where-Object { $_ -match '"Action":"pass"' -and $_ -notmatch '"Test"' } |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            ForEach-Object { Write-Output "Passed $($_.Package)" }

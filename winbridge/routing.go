@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/windows"
@@ -24,6 +25,12 @@ import (
 // физический интерфейс, а не в туннель. Смена шлюза (Refresh) переносит все
 // поставленные маршруты на новый.
 //
+// DNS-серверы самого туннеля (Interface.DNS) — исключение: bypass к ним не
+// ставится никогда. Закалённый резолвер прокси спрашивает системные DNS, Yandex
+// и Google, и /32 к такому серверу жил бы до отключения. Если тот же адрес
+// стоит DNS-сервером туннеля (1.1.1.1 у адаптера и в конфиге, 8.8.8.8 в
+// конфиге), все DNS-запросы Windows к нему шли бы мимо туннеля.
+//
 // Вся работа идёт через IP Helper API (winipcfg), без запуска netsh/route —
 // спавн внешних процессов из админ-процесса повышает heuristic-score антивируса.
 type RouteManager struct {
@@ -31,17 +38,39 @@ type RouteManager struct {
 	physLUID winipcfg.LUID // LUID физического интерфейса с дефолтным маршрутом
 	physGW   netip.Addr    // IP шлюза физической сети
 	owned    map[netip.Addr]struct{}
-	order    []netip.Addr // owned в порядке добавления (для журнала и отката)
+	order    []netip.Addr            // owned в порядке добавления (для журнала и отката)
+	inTunnel map[netip.Addr]struct{} // DNS-серверы туннеля: bypass к ним запрещён
 }
 
+// errTunnelDNS — отказ в bypass-маршруте к DNS-серверу туннеля. Резолвер прокси
+// получает его как ошибку дозвона и сразу берёт следующий сервер из списка.
+var errTunnelDNS = errors.New("is the tunnel's DNS server, kept inside the tunnel")
+
 // NewRouteManager создаёт RouteManager, определяя текущий дефолтный шлюз.
-func NewRouteManager() (*RouteManager, error) {
+// tunnelDNS — DNS-серверы туннеля (Interface.DNS); записи, которые не IP
+// (домены поиска), пропускаются.
+func NewRouteManager(tunnelDNS []string) (*RouteManager, error) {
 	gw, luid, ifIndex, err := defaultRoute()
 	if err != nil {
 		return nil, fmt.Errorf("cannot find default gateway: %w", err)
 	}
 	log.Printf("[ROUTE] Physical gateway: %s via ifindex %d", gw, ifIndex)
-	return &RouteManager{physLUID: luid, physGW: gw, owned: map[netip.Addr]struct{}{}}, nil
+	inTunnel := tunnelDNSSet(tunnelDNS)
+	if len(inTunnel) > 0 {
+		log.Printf("[ROUTE] Tunnel DNS servers never get a bypass route: %v", tunnelDNS)
+	}
+	return &RouteManager{physLUID: luid, physGW: gw, owned: map[netip.Addr]struct{}{}, inTunnel: inTunnel}, nil
+}
+
+// tunnelDNSSet разбирает Interface.DNS в множество адресов для inTunnel.
+func tunnelDNSSet(servers []string) map[netip.Addr]struct{} {
+	set := map[netip.Addr]struct{}{}
+	for _, s := range servers {
+		if ip, err := netip.ParseAddr(strings.TrimSpace(s)); err == nil {
+			set[ip.Unmap()] = struct{}{}
+		}
+	}
+	return set
 }
 
 // EnsureBypassRoute ставит host-маршрут до ip через физический шлюз, если его
@@ -51,7 +80,8 @@ func NewRouteManager() (*RouteManager, error) {
 // Приватные, link-local и прочие неглобальные адреса не трогаются: DNS-сервер
 // в локальной сети и так on-link, а /32 через шлюз увёл бы трафик к нему
 // кружным путём. Адрес другого семейства, чем шлюз, тоже оставляется как есть —
-// маршрутизировать его не через что.
+// маршрутизировать его не через что. DNS-сервер туннеля получает отказ
+// (errTunnelDNS) — см. комментарий к RouteManager.
 func (r *RouteManager) EnsureBypassRoute(ipStr string) error {
 	ip, err := netip.ParseAddr(ipStr)
 	if err != nil {
@@ -60,6 +90,9 @@ func (r *RouteManager) EnsureBypassRoute(ipStr string) error {
 	ip = ip.Unmap()
 	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return nil
+	}
+	if _, ok := r.inTunnel[ip]; ok {
+		return fmt.Errorf("%s %w", ip, errTunnelDNS)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -138,6 +171,35 @@ func (r *RouteManager) Refresh() bool {
 		}
 	}
 	return true
+}
+
+// Reassert заново ставит все свои host-маршруты через текущий шлюз — когда
+// вернулся тот же шлюз (Wi-Fi переподключился, ноутбук проснулся). Если Windows
+// снял маршруты вместе с интерфейсом, owned об этом не знает, и
+// EnsureBypassRoute считал бы их стоящими: TURN и VK ушли бы в туннель до
+// переподключения. Уже стоящий маршрут не трогается; в журнал — только если
+// какие-то действительно пропадали.
+func (r *RouteManager) Reassert() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	restored := 0
+	for _, ip := range r.order {
+		if ip.Is4() != r.physGW.Is4() {
+			continue
+		}
+		dst := netip.PrefixFrom(ip, ip.BitLen())
+		err := r.physLUID.AddRoute(dst, r.physGW, 0)
+		switch {
+		case err == nil:
+			restored++
+		case errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS):
+		default:
+			log.Printf("[ROUTE] Warning: cannot re-add route for %s via %s: %v", ip, r.physGW, err)
+		}
+	}
+	if restored > 0 {
+		log.Printf("[ROUTE] %d of %d bypass route(s) had gone with the interface — restored via %s", restored, len(r.order), r.physGW)
+	}
 }
 
 // Cleanup удаляет добавленные host-маршруты.
@@ -246,9 +308,16 @@ func DefaultGateway() (string, string, error) {
 	return gw.String(), strconv.FormatUint(uint64(ifIndex), 10), nil
 }
 
-// defaultRoute находит лучший (минимальная метрика) дефолтный маршрут IPv4 с
-// настоящим next-hop'ом, игнорируя on-link маршруты (в т.ч. 0.0.0.0/0 нашего
-// собственного wintun-интерфейса, у которого next-hop неопределён).
+// defaultRoute находит лучший дефолтный маршрут IPv4 с настоящим next-hop'ом,
+// игнорируя on-link маршруты (в т.ч. 0.0.0.0/0 нашего собственного
+// wintun-интерфейса, у которого next-hop неопределён).
+//
+// «Лучший» — как его выбирает Windows: по сумме метрики маршрута и метрики
+// интерфейса. Одной метрики маршрута мало: у маршрутов от DHCP она обычно 0 и
+// у Wi-Fi, и у Ethernet, а предпочтение задаёт метрика интерфейса (по скорости
+// линка). По одной метрике маршрута побеждал первый в таблице, и переход
+// Windows на Ethernet к тому же роутеру не был виден ни CheckNetworkChange, ни
+// RouteManager.Refresh (ревью Codex 24.10).
 func defaultRoute() (gw netip.Addr, luid winipcfg.LUID, ifIndex uint32, err error) {
 	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
@@ -265,9 +334,13 @@ func defaultRoute() (gw netip.Addr, luid winipcfg.LUID, ifIndex uint32, err erro
 		if !nh.IsValid() || nh.IsUnspecified() {
 			continue // on-link (например, наш wintun) — пропускаем
 		}
-		if best == -1 || rows[i].Metric < bestMetric {
+		metric := rows[i].Metric
+		if iface, err := rows[i].InterfaceLUID.IPInterface(windows.AF_INET); err == nil {
+			metric += iface.Metric
+		}
+		if best == -1 || metric < bestMetric {
 			best = i
-			bestMetric = rows[i].Metric
+			bestMetric = metric
 		}
 	}
 	if best == -1 {
